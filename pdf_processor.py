@@ -663,197 +663,116 @@ def generate_grounded_answer(
         "evidence": verified_evidence,
     }
 
+def generate_scanned_pdf_answer(pdf_bytes, question, client):
+    """Use Gemini's native PDF understanding for scanned/image PDFs."""
 
-def generate_scanned_pdf_answer(
-    pdf_bytes: bytes,
-    question: str,
-    client: genai.Client,
-) -> dict[str, Any]:
-    """
-    Analyze a scanned/image-based PDF directly with Gemini's
-    multimodal document understanding.
-    """
+    import tempfile
+    import os
 
-    uploaded_file = client.files.upload(
-        file=pdf_bytes,
-        config={
-            "mime_type": "application/pdf"
-        },
-    )
+    temp_path = None
 
-    prompt = f"""
-You are EviNex AI, an evidence-grounded
-multimodal document intelligence system.
+    try:
+        # Save PDF bytes as a real temporary PDF file
+        with tempfile.NamedTemporaryFile(
+            suffix=".pdf",
+            delete=False
+        ) as temp_file:
+            temp_file.write(pdf_bytes)
+            temp_path = temp_file.name
 
-The uploaded PDF may be scanned or image-based.
+        # Upload the actual PDF file to Gemini
+        uploaded_file = client.files.upload(
+            file=temp_path
+        )
 
-Visually inspect the PDF pages and answer
-the user's question using ONLY information
-contained in the PDF.
+        prompt = f"""
+You are EviNex AI, an evidence-grounded document intelligence system.
+
+Answer the user's question using ONLY the uploaded PDF.
+
+The PDF may be scanned or image-based, so inspect the visual contents
+of the pages carefully.
 
 User question:
 {question}
 
 Rules:
-
 1. Do not use outside knowledge.
+2. If the answer cannot be determined from the PDF, return exactly:
+   "Cannot determine from the document."
+3. Give supporting evidence from the PDF.
+4. Include the page number for each piece of evidence.
+5. Do not invent page numbers or evidence.
+6. Keep the answer concise.
 
-2. Do not invent or guess information.
-
-3. If the answer cannot be determined from
-the PDF, return exactly:
-Cannot determine from the document.
-
-4. Identify the page containing the evidence.
-
-5. Provide a short supporting quotation or
-faithful transcription from that page.
-
-6. If the PDF contains tables, charts,
-figures, or diagrams, use their visible
-information when answering.
-
-7. Every answer must have supporting evidence.
-
-Return JSON in exactly this structure:
+Return JSON with this structure:
 
 {{
-    "answer": "answer based only on the PDF",
-    "evidence": [
-        {{
-            "page_number": 1,
-            "quote": "supporting text or transcription"
-        }}
-    ]
+  "answer": "your answer",
+  "evidence": [
+    {{
+      "quote": "short supporting text or description",
+      "page_number": 1
+    }}
+  ]
 }}
 """
 
-    response = client.models.generate_content(
-        model=os.getenv(
-            "GEMINI_MODEL",
-            "gemini-3.5-flash-lite",
-        ),
-        contents=[
-            prompt,
-            uploaded_file,
-        ],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=types.Schema(
-                type=types.Type.OBJECT,
-                properties={
-                    "answer": types.Schema(
-                        type=types.Type.STRING
-                    ),
-                    "evidence": types.Schema(
-                        type=types.Type.ARRAY,
-                        items=types.Schema(
-                            type=types.Type.OBJECT,
-                            properties={
-                                "page_number": types.Schema(
-                                    type=types.Type.INTEGER
-                                ),
-                                "quote": types.Schema(
-                                    type=types.Type.STRING
-                                ),
-                            },
-                            required=[
-                                "page_number",
-                                "quote",
-                            ],
-                        ),
-                    ),
-                },
-                required=[
-                    "answer",
-                    "evidence",
-                ],
+        response = client.models.generate_content(
+            model=os.getenv(
+                "GEMINI_MODEL",
+                "gemini-3.5-flash-lite"
             ),
-        ),
-    )
-
-    if not response.text:
-        return {
-            "answer": FALLBACK_ANSWER,
-            "evidence": [],
-        }
-
-    try:
-        data = json.loads(
-            response.text
+            contents=[uploaded_file, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "answer": types.Schema(
+                            type=types.Type.STRING
+                        ),
+                        "evidence": types.Schema(
+                            type=types.Type.ARRAY,
+                            items=types.Schema(
+                                type=types.Type.OBJECT,
+                                properties={
+                                    "quote": types.Schema(
+                                        type=types.Type.STRING
+                                    ),
+                                    "page_number": types.Schema(
+                                        type=types.Type.INTEGER
+                                    ),
+                                },
+                                required=[
+                                    "quote",
+                                    "page_number"
+                                ],
+                            ),
+                        ),
+                    },
+                    required=["answer", "evidence"],
+                ),
+                max_output_tokens=4096,
+            ),
         )
-    except (
-        json.JSONDecodeError,
-        TypeError,
-    ):
+
+        result = json.loads(response.text)
+
+        # Validate the answer
+        answer = result.get("answer", "").strip()
+
+        if not answer:
+            answer = FALLBACK_ANSWER
+
+        evidence = result.get("evidence", [])
+
         return {
-            "answer": FALLBACK_ANSWER,
-            "evidence": [],
+            "answer": answer,
+            "evidence": evidence,
         }
 
-    answer = data.get(
-        "answer",
-        FALLBACK_ANSWER,
-    )
-
-    evidence = data.get(
-        "evidence",
-        [],
-    )
-
-    if (
-        not isinstance(answer, str)
-        or not answer.strip()
-        or answer.strip() == FALLBACK_ANSWER
-    ):
-        return {
-            "answer": FALLBACK_ANSWER,
-            "evidence": [],
-        }
-
-    if not isinstance(evidence, list) or not evidence:
-        return {
-            "answer": FALLBACK_ANSWER,
-            "evidence": [],
-        }
-
-    verified_evidence: list[dict[str, Any]] = []
-
-    for item in evidence:
-
-        if not isinstance(item, dict):
-            continue
-
-        try:
-            page_number = int(
-                item.get("page_number")
-            )
-        except (
-            TypeError,
-            ValueError,
-        ):
-            continue
-
-        quote = item.get("quote")
-
-        if (
-            isinstance(quote, str)
-            and quote.strip()
-        ):
-            verified_evidence.append(
-                {
-                    "page_number": page_number,
-                    "quote": quote.strip(),
-                }
-            )
-
-    if not verified_evidence:
-        return {
-            "answer": FALLBACK_ANSWER,
-            "evidence": [],
-        }
-
-    return {
-        "answer": answer.strip(),
-        "evidence": verified_evidence,
-    }
+    finally:
+        # Remove temporary PDF
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
