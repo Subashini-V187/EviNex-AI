@@ -1,4 +1,4 @@
-"""DocuLens AI: ask questions about the contents of a PDF."""
+"""EviNex AI: ask questions about the contents of a PDF."""
 
 from __future__ import annotations
 
@@ -20,8 +20,8 @@ load_dotenv()
 MAX_PDF_SIZE_BYTES = 20 * 1024 * 1024
 PREVIEW_CHARACTER_LIMIT = 5000
 
-st.set_page_config(page_title="DocuLens AI", page_icon="📄", layout="centered")
-st.title("DocuLens AI")
+st.set_page_config(page_title="EviNex AI", page_icon="📄", layout="centered")
+st.title("EviNex AI")
 st.write("Upload a PDF and ask a question. Answers are based only on the document.")
 
 uploaded_file = st.file_uploader("Choose a PDF", type=["pdf"])
@@ -120,9 +120,9 @@ if submitted:
                     "answer": None,
                     "evidence": [],
                     "error": (
-                        "The OpenAI API key is not configured. Add "
-                        "`OPENAI_API_KEY` in Replit Secrets, then restart "
-                        "the app."
+                        "The Gemini API key is not available to the app. "
+                        "Check that `GEMINI_API_KEY` is saved in Replit Secrets, "
+                        "then restart the app."
                     ),
                     "document_hash": document_hash,
                 }
@@ -132,8 +132,8 @@ if submitted:
                     "answer": None,
                     "evidence": [],
                     "error": (
-                        "The answer service could not complete the request. "
-                        "Check the OpenAI key, account access, and model setting."
+                        "Gemini could not complete the request. Check the "
+                        "Gemini API key and model access."
                     ),
                     "document_hash": document_hash,
                 }

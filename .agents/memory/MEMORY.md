@@ -1,1 +1,1 @@
-- [DocuLens first-version scope](doculens-ai-scope.md) — keep the initial product to document-grounded PDF Q&A; avoid unrelated account and admin features.
+- [EviNex first-version scope](doculens-ai-scope.md) — keep the initial product to document-grounded PDF Q&A; avoid unrelated account and admin features.

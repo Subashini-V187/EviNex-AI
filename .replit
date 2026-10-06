@@ -18,10 +18,10 @@ author = "agent"
 
 [[workflows.workflow.tasks]]
 task = "workflow.run"
-args = "DocuLens AI"
+args = "EviNex AI"
 
 [[workflows.workflow]]
-name = "DocuLens AI"
+name = "EviNex AI"
 author = "agent"
 
 [[workflows.workflow.tasks]]

@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 requires-python = ">=3.11"
 dependencies = [
-    "openai>=3.24.0",
+    "google-genai>=2.28.0",
     "pymupdf>=1.28.2",
     "python-dotenv>=1.2.4",
     "streamlit>=1.65.0",

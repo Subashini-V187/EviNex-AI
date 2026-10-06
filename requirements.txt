@@ -1,4 +1,4 @@
 streamlit==1.65.0
 PyMuPDF==1.28.2
-openai==3.24.0
 python-dotenv==1.2.4
+google-genai==2.28.0
