@@ -6,7 +6,6 @@ import json
 import math
 import os
 import re
-from collections import Counter
 from typing import Any
 
 import pymupdf
@@ -15,54 +14,6 @@ from google.genai import types
 
 
 FALLBACK_ANSWER = "Cannot determine from the document."
-
-STOP_WORDS = {
-    "a",
-    "about",
-    "an",
-    "and",
-    "are",
-    "as",
-    "at",
-    "be",
-    "by",
-    "can",
-    "could",
-    "did",
-    "do",
-    "does",
-    "for",
-    "from",
-    "give",
-    "how",
-    "i",
-    "in",
-    "is",
-    "it",
-    "me",
-    "of",
-    "on",
-    "or",
-    "please",
-    "show",
-    "tell",
-    "that",
-    "the",
-    "their",
-    "this",
-    "to",
-    "was",
-    "what",
-    "when",
-    "where",
-    "which",
-    "who",
-    "why",
-    "with",
-    "would",
-    "you",
-    "your",
-}
 
 
 def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
@@ -84,21 +35,34 @@ def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
         document.close()
 
 
-def _tokens(text: str) -> list[str]:
-    return re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE)
+def create_gemini_client() -> genai.Client:
+    """Create the official Gemini client using the Replit Secret."""
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured.")
+    return genai.Client(api_key=api_key)
 
 
 def _make_chunks(
-    pages: list[dict[str, Any]], chunk_size: int = 1400, overlap: int = 200
+    pages: list[dict[str, Any]], chunk_size: int = 300, overlap: int = 50
 ) -> list[dict[str, Any]]:
     """Split each page into overlapping, readable pieces without crossing pages."""
+    if chunk_size <= 0 or overlap < 0 or overlap >= chunk_size:
+        raise ValueError("Chunk overlap must be smaller than a positive chunk size.")
+
     chunks: list[dict[str, Any]] = []
     step = chunk_size - overlap
 
     for page in pages:
         words = page["text"].split()
-        for start in range(0, len(words), step):
-            text = " ".join(words[start : start + chunk_size]).strip()
+        start = 0
+        while start < len(words):
+            end = min(start + chunk_size, len(words))
+            remaining_words = len(words) - end
+            if 0 < remaining_words <= overlap:
+                end = len(words)
+
+            text = " ".join(words[start:end]).strip()
             if text:
                 chunks.append(
                     {
@@ -106,63 +70,111 @@ def _make_chunks(
                         "text": text,
                     }
                 )
+            if end == len(words):
+                break
+            start = end - overlap
 
     return chunks
 
 
-def retrieve_relevant_content(
-    pages: list[dict[str, Any]], question: str, top_k: int = 5
-) -> list[dict[str, Any]]:
-    """Rank text chunks with a small BM25-style lexical search."""
-    question_terms = {
-        word for word in _tokens(question) if len(word) > 2 and word not in STOP_WORDS
-    }
-    if not question_terms:
+def chunk_document_pages(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Create overlapping chunks while retaining their original page numbers."""
+    return _make_chunks(pages)
+
+
+def _embed_texts(
+    texts: list[str], task_type: str, client: genai.Client
+) -> list[list[float]]:
+    """Embed texts in batches and return one vector per input text."""
+    if not texts:
         return []
 
-    chunks = _make_chunks(pages)
+    vectors: list[list[float]] = []
+    batch_size = 100
+    model = os.getenv("GEMINI_EMBEDDING_MODEL", "gemini-embedding-001")
+
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start : start + batch_size]
+        response = client.models.embed_content(
+            model=model,
+            contents=batch,
+            config=types.EmbedContentConfig(task_type=task_type),
+        )
+        embeddings = response.embeddings or []
+        if len(embeddings) != len(batch):
+            raise RuntimeError("Gemini returned an incomplete set of embeddings.")
+
+        for embedding in embeddings:
+            values = embedding.values or []
+            if not values:
+                raise RuntimeError("Gemini returned an empty text embedding.")
+            vectors.append([float(value) for value in values])
+
+    return vectors
+
+
+def embed_document_chunks(
+    chunks: list[dict[str, Any]], client: genai.Client | None = None
+) -> list[list[float]]:
+    """Embed document chunks for semantic retrieval."""
     if not chunks:
         return []
 
-    chunk_terms = [Counter(_tokens(chunk["text"])) for chunk in chunks]
-    document_frequency = {
-        term: sum(1 for counts in chunk_terms if counts[term] > 0)
-        for term in question_terms
-    }
-    average_length = sum(sum(counts.values()) for counts in chunk_terms) / len(chunks)
-    average_length = max(average_length, 1)
-    scored_chunks: list[tuple[float, dict[str, Any]]] = []
+    client = client or create_gemini_client()
+    return _embed_texts(
+        [chunk["text"] for chunk in chunks],
+        task_type="RETRIEVAL_DOCUMENT",
+        client=client,
+    )
 
-    for chunk, term_counts in zip(chunks, chunk_terms):
-        matched_terms = question_terms.intersection(term_counts)
-        if not matched_terms:
-            continue
 
-        length = sum(term_counts.values())
-        score = 0.0
-        for term in matched_terms:
-            frequency = term_counts[term]
-            frequency_in_chunks = document_frequency[term]
-            inverse_frequency = math.log(
-                1
-                + (len(chunks) - frequency_in_chunks + 0.5)
-                / (frequency_in_chunks + 0.5)
-            )
-            denominator = frequency + 1.2 * (
-                0.25 + 0.75 * length / average_length
-            )
-            score += inverse_frequency * (frequency * 2.2) / denominator
+def _cosine_similarity(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right):
+        raise ValueError("Embedding vectors must have the same dimensions.")
 
-        normalized_question = " ".join(_tokens(question))
-        normalized_chunk = " ".join(_tokens(chunk["text"]))
-        if normalized_question and normalized_question in normalized_chunk:
-            score += 2.0
+    left_norm = math.sqrt(sum(value * value for value in left))
+    right_norm = math.sqrt(sum(value * value for value in right))
+    if left_norm == 0 or right_norm == 0:
+        return 0.0
 
-        score += len(matched_terms) / len(question_terms)
-        scored_chunks.append((score, chunk))
+    dot_product = sum(a * b for a, b in zip(left, right))
+    return dot_product / (left_norm * right_norm)
 
-    scored_chunks.sort(key=lambda item: item[0], reverse=True)
-    return [chunk for _, chunk in scored_chunks[:top_k]]
+
+def retrieve_relevant_content(
+    pages: list[dict[str, Any]],
+    question: str,
+    top_k: int = 5,
+    *,
+    chunks: list[dict[str, Any]] | None = None,
+    document_embeddings: list[list[float]] | None = None,
+    client: genai.Client | None = None,
+) -> list[dict[str, Any]]:
+    """Return the top page-aware chunks ranked by Gemini embedding similarity."""
+    if not question.strip() or top_k <= 0:
+        return []
+
+    chunks = chunks if chunks is not None else chunk_document_pages(pages)
+    if not chunks:
+        return []
+
+    client = client or create_gemini_client()
+    if document_embeddings is None:
+        document_embeddings = embed_document_chunks(chunks, client)
+    if len(document_embeddings) != len(chunks):
+        raise RuntimeError("Document chunks and embeddings are out of sync.")
+
+    query_embedding = _embed_texts(
+        [question.strip()],
+        task_type="RETRIEVAL_QUERY",
+        client=client,
+    )[0]
+    scored_chunks = [
+        (_cosine_similarity(query_embedding, embedding), index, chunk)
+        for index, (chunk, embedding) in enumerate(zip(chunks, document_embeddings))
+    ]
+    scored_chunks.sort(key=lambda item: (-item[0], item[1]))
+    return [chunk for _, _, chunk in scored_chunks[:top_k]]
 
 
 def _normalized_text(text: str) -> str:
@@ -170,14 +182,12 @@ def _normalized_text(text: str) -> str:
 
 
 def generate_grounded_answer(
-    question: str, retrieved_chunks: list[dict[str, Any]]
+    question: str,
+    retrieved_chunks: list[dict[str, Any]],
+    client: genai.Client | None = None,
 ) -> dict[str, Any]:
     """Ask Gemini using retrieved excerpts and verify every returned quotation."""
-    api_key = os.getenv("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise RuntimeError("GEMINI_API_KEY is not configured.")
-
-    client = genai.Client(api_key=api_key)
+    client = client or create_gemini_client()
 
     context = "\n\n".join(
         f"[Source page {chunk['page_number']}]\n{chunk['text']}"

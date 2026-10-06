@@ -9,6 +9,9 @@ from dotenv import load_dotenv
 
 from pdf_processor import (
     FALLBACK_ANSWER,
+    chunk_document_pages,
+    create_gemini_client,
+    embed_document_chunks,
     extract_pdf_pages,
     generate_grounded_answer,
     retrieve_relevant_content,
@@ -45,6 +48,8 @@ if st.session_state.get("document_hash") != document_hash:
 
     st.session_state["document_hash"] = document_hash
     st.session_state["document_pages"] = pages
+    st.session_state["document_chunks"] = chunk_document_pages(pages)
+    st.session_state.pop("document_embeddings", None)
     st.session_state.pop("answer_result", None)
 
 pages = st.session_state["document_pages"]
@@ -93,50 +98,83 @@ if submitted:
     if not question.strip():
         st.warning("Enter a question to continue.")
     else:
-        relevant_chunks = retrieve_relevant_content(pages, question.strip())
-        if not relevant_chunks:
+        try:
+            with st.spinner("Finding relevant passages and asking Gemini..."):
+                client = create_gemini_client()
+                document_chunks = st.session_state.get("document_chunks")
+                if document_chunks is None:
+                    document_chunks = chunk_document_pages(pages)
+
+                document_embeddings = st.session_state.get(
+                    "document_embeddings"
+                )
+                if document_embeddings is None:
+                    document_embeddings = embed_document_chunks(
+                        document_chunks, client
+                    )
+                    st.session_state["document_chunks"] = document_chunks
+                    st.session_state["document_embeddings"] = (
+                        document_embeddings
+                    )
+
+                relevant_chunks = retrieve_relevant_content(
+                    pages,
+                    question.strip(),
+                    top_k=5,
+                    chunks=document_chunks,
+                    document_embeddings=document_embeddings,
+                    client=client,
+                )
+                if not relevant_chunks:
+                    answer_result = {
+                        "question": question.strip(),
+                        "answer": FALLBACK_ANSWER,
+                        "evidence": [],
+                        "error": None,
+                        "document_hash": document_hash,
+                    }
+                else:
+                    answer = generate_grounded_answer(
+                        question.strip(), relevant_chunks, client=client
+                    )
+                    answer_result = {
+                        "question": question.strip(),
+                        "answer": answer["answer"],
+                        "evidence": answer["evidence"],
+                        "error": None,
+                        "document_hash": document_hash,
+                    }
+                st.session_state["answer_result"] = answer_result
+        except RuntimeError as exc:
+            if str(exc) == "GEMINI_API_KEY is not configured.":
+                error_message = (
+                    "The Gemini API key is not available to the app. "
+                    "Check that `GEMINI_API_KEY` is saved in Replit Secrets, "
+                    "then restart the app."
+                )
+            else:
+                error_message = (
+                    "Gemini could not complete the request. Check the "
+                    "Gemini API key and model access."
+                )
             st.session_state["answer_result"] = {
                 "question": question.strip(),
-                "answer": FALLBACK_ANSWER,
+                "answer": None,
                 "evidence": [],
-                "error": None,
+                "error": error_message,
                 "document_hash": document_hash,
             }
-        else:
-            try:
-                answer = generate_grounded_answer(
-                    question.strip(), relevant_chunks
-                )
-                st.session_state["answer_result"] = {
-                    "question": question.strip(),
-                    "answer": answer["answer"],
-                    "evidence": answer["evidence"],
-                    "error": None,
-                    "document_hash": document_hash,
-                }
-            except RuntimeError:
-                st.session_state["answer_result"] = {
-                    "question": question.strip(),
-                    "answer": None,
-                    "evidence": [],
-                    "error": (
-                        "The Gemini API key is not available to the app. "
-                        "Check that `GEMINI_API_KEY` is saved in Replit Secrets, "
-                        "then restart the app."
-                    ),
-                    "document_hash": document_hash,
-                }
-            except Exception:
-                st.session_state["answer_result"] = {
-                    "question": question.strip(),
-                    "answer": None,
-                    "evidence": [],
-                    "error": (
-                        "Gemini could not complete the request. Check the "
-                        "Gemini API key and model access."
-                    ),
-                    "document_hash": document_hash,
-                }
+        except Exception:
+            st.session_state["answer_result"] = {
+                "question": question.strip(),
+                "answer": None,
+                "evidence": [],
+                "error": (
+                    "Gemini could not complete the request. Check the "
+                    "Gemini API key and model access."
+                ),
+                "document_hash": document_hash,
+            }
 
 result = st.session_state.get("answer_result")
 if result and result.get("document_hash") == document_hash:
