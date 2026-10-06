@@ -390,3 +390,81 @@ def generate_grounded_answer(
         )
 
     return {"answer": answer.strip(), "evidence": verified_evidence}
+    def generate_scanned_pdf_answer(pdf_bytes, question, client):
+    """
+    Ask Gemini to understand a scanned/image-based PDF directly.
+    Used when normal PDF text extraction returns no text.
+    """
+
+    uploaded_file = client.files.upload(
+        file=pdf_bytes,
+        config={"mime_type": "application/pdf"},
+    )
+
+    prompt = f"""
+You are EviNex AI, an evidence-grounded document intelligence system.
+
+Answer the user's question using ONLY the uploaded PDF.
+
+The PDF may be scanned or image-based, so visually inspect the pages.
+
+User question:
+{question}
+
+Rules:
+1. Do not use outside knowledge.
+2. If the answer cannot be determined from the PDF, say exactly:
+   Cannot determine from the document.
+3. Give the page number where the answer was found.
+4. Give a short supporting quote or transcription from the relevant page.
+5. Do not invent information.
+
+Return JSON in this format:
+
+{{
+  "answer": "your answer",
+  "evidence": [
+    {{
+      "page_number": 1,
+      "quote": "supporting text from the PDF"
+    }}
+  ]
+}}
+"""
+
+    response = client.models.generate_content(
+        model=os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+        contents=[prompt, uploaded_file],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "answer": types.Schema(type=types.Type.STRING),
+                    "evidence": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(
+                            type=types.Type.OBJECT,
+                            properties={
+                                "page_number": types.Schema(
+                                    type=types.Type.INTEGER
+                                ),
+                                "quote": types.Schema(
+                                    type=types.Type.STRING
+                                ),
+                            },
+                            required=["page_number", "quote"],
+                        ),
+                    ),
+                },
+                required=["answer", "evidence"],
+            ),
+        ),
+    )
+
+    data = json.loads(response.text)
+
+    return {
+        "answer": data.get("answer", FALLBACK_ANSWER),
+        "evidence": data.get("evidence", []),
+    }
