@@ -104,110 +104,113 @@ if submitted:
         st.warning("Enter a question to continue.")
     else:
         try:
-    with st.spinner("Analyzing the document and asking Gemini..."):
-        client = create_gemini_client()
+            with st.spinner("Analyzing the document and asking Gemini..."):
+                client = create_gemini_client()
 
-        # Scanned/image-only PDF
-        if is_scanned_pdf:
-            answer = generate_scanned_pdf_answer(
-                pdf_bytes,
-                question.strip(),
-                client,
-            )
+                # Scanned/image-only PDF
+                if is_scanned_pdf:
+                    answer = generate_scanned_pdf_answer(
+                        pdf_bytes,
+                        question.strip(),
+                        client,
+                    )
 
-            answer_result = {
+                    answer_result = {
+                        "question": question.strip(),
+                        "answer": answer["answer"],
+                        "evidence": answer["evidence"],
+                        "error": None,
+                        "document_hash": document_hash,
+                    }
+
+                # Normal text PDF
+                else:
+                    document_chunks = st.session_state.get(
+                        "document_chunks"
+                    )
+
+                    if document_chunks is None:
+                        document_chunks = chunk_document_pages(pages)
+
+                    document_embeddings = st.session_state.get(
+                        "document_embeddings"
+                    )
+
+                    if document_embeddings is None:
+                        document_embeddings = embed_document_chunks(
+                            document_chunks,
+                            client,
+                        )
+
+                        st.session_state["document_chunks"] = (
+                            document_chunks
+                        )
+                        st.session_state["document_embeddings"] = (
+                            document_embeddings
+                        )
+
+                    relevant_chunks = retrieve_relevant_content(
+                        pages,
+                        question.strip(),
+                        top_k=5,
+                        chunks=document_chunks,
+                        document_embeddings=document_embeddings,
+                        client=client,
+                    )
+
+                    if not relevant_chunks:
+                        answer_result = {
+                            "question": question.strip(),
+                            "answer": FALLBACK_ANSWER,
+                            "evidence": [],
+                            "error": None,
+                            "document_hash": document_hash,
+                        }
+
+                    else:
+                        answer = generate_grounded_answer(
+                            question.strip(),
+                            relevant_chunks,
+                            client=client,
+                        )
+
+                        answer_result = {
+                            "question": question.strip(),
+                            "answer": answer["answer"],
+                            "evidence": answer["evidence"],
+                            "error": None,
+                            "document_hash": document_hash,
+                        }
+
+                st.session_state["answer_result"] = answer_result
+
+        except RuntimeError as exc:
+            if str(exc) == "GEMINI_API_KEY is not configured.":
+                error_message = (
+                    "The Gemini API key is not available to the app. "
+                    "Check that GEMINI_API_KEY is saved in Streamlit Secrets."
+                )
+            else:
+                error_message = (
+                    f"Gemini could not complete the request: {exc}"
+                )
+
+            st.session_state["answer_result"] = {
                 "question": question.strip(),
-                "answer": answer["answer"],
-                "evidence": answer["evidence"],
-                "error": None,
+                "answer": None,
+                "evidence": [],
+                "error": error_message,
                 "document_hash": document_hash,
             }
 
-        # Normal text PDF
-        else:
-            document_chunks = st.session_state.get("document_chunks")
-
-            if document_chunks is None:
-                document_chunks = chunk_document_pages(pages)
-
-            document_embeddings = st.session_state.get(
-                "document_embeddings"
-            )
-
-            if document_embeddings is None:
-                document_embeddings = embed_document_chunks(
-                    document_chunks,
-                    client,
-                )
-
-                st.session_state["document_chunks"] = document_chunks
-                st.session_state["document_embeddings"] = (
-                    document_embeddings
-                )
-
-            relevant_chunks = retrieve_relevant_content(
-                pages,
-                question.strip(),
-                top_k=5,
-                chunks=document_chunks,
-                document_embeddings=document_embeddings,
-                client=client,
-            )
-
-            if not relevant_chunks:
-                answer_result = {
-                    "question": question.strip(),
-                    "answer": FALLBACK_ANSWER,
-                    "evidence": [],
-                    "error": None,
-                    "document_hash": document_hash,
-                }
-
-            else:
-                answer = generate_grounded_answer(
-                    question.strip(),
-                    relevant_chunks,
-                    client=client,
-                )
-
-                answer_result = {
-                    "question": question.strip(),
-                    "answer": answer["answer"],
-                    "evidence": answer["evidence"],
-                    "error": None,
-                    "document_hash": document_hash,
-                }
-
-        st.session_state["answer_result"] = answer_result
-
-except RuntimeError as exc:
-    if str(exc) == "GEMINI_API_KEY is not configured.":
-        error_message = (
-            "The Gemini API key is not available to the app. "
-            "Check that GEMINI_API_KEY is saved in Streamlit Secrets."
-        )
-    else:
-        error_message = (
-            f"Gemini could not complete the request: {exc}"
-        )
-
-    st.session_state["answer_result"] = {
-        "question": question.strip(),
-        "answer": None,
-        "evidence": [],
-        "error": error_message,
-        "document_hash": document_hash,
-    }
-
-except Exception as exc:
-    st.session_state["answer_result"] = {
-        "question": question.strip(),
-        "answer": None,
-        "evidence": [],
-        "error": f"Gemini could not complete the request: {exc}",
-        "document_hash": document_hash,
-    }
-
+        except Exception as exc:
+            st.session_state["answer_result"] = {
+                "question": question.strip(),
+                "answer": None,
+                "evidence": [],
+                "error": f"Gemini could not complete the request: {exc}",
+                "document_hash": document_hash,
+            }
 result = st.session_state.get("answer_result")
 if result and result.get("document_hash") == document_hash:
     st.divider()
