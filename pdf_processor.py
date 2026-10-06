@@ -16,6 +16,69 @@ from google.genai import types
 FALLBACK_ANSWER = "Cannot determine from the document."
 
 
+def _extract_page_tables(
+    page: pymupdf.Page, page_number: int
+) -> list[dict[str, Any]]:
+    """Extract ruled tables, then try text alignment if no table was found."""
+    if not hasattr(page, "find_tables"):
+        return []
+
+    for strategy in ("lines", "text"):
+        try:
+            detected_tables = page.find_tables(strategy=strategy).tables
+        except Exception:
+            continue
+
+        tables: list[dict[str, Any]] = []
+        for detected_table in detected_tables:
+            try:
+                raw_rows = detected_table.extract()
+            except Exception:
+                continue
+
+            rows = [
+                [
+                    str(cell).strip() if cell is not None else ""
+                    for cell in row
+                ]
+                for row in raw_rows
+            ]
+            while rows and not any(rows[-1]):
+                rows.pop()
+            if len(rows) < 2:
+                continue
+
+            column_count = max(len(row) for row in rows)
+            if column_count < 2:
+                continue
+            rows = [row + [""] * (column_count - len(row)) for row in rows]
+            while column_count > 1 and all(not row[-1] for row in rows):
+                rows = [row[:-1] for row in rows]
+                column_count -= 1
+
+            columns = [
+                cell or f"Column {index + 1}"
+                for index, cell in enumerate(rows[0])
+            ]
+            data_rows = rows[1:]
+            if not any(any(row) for row in data_rows):
+                continue
+
+            tables.append(
+                {
+                    "page_number": page_number,
+                    "table_index": len(tables) + 1,
+                    "columns": columns,
+                    "rows": data_rows,
+                }
+            )
+
+        if tables:
+            return tables
+
+    return []
+
+
 def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
     """Extract selectable text from a PDF, preserving one-based page numbers."""
     try:
@@ -27,10 +90,17 @@ def extract_pdf_pages(pdf_bytes: bytes) -> list[dict[str, Any]]:
         if document.is_encrypted:
             raise ValueError("This PDF is password-protected and cannot be read.")
 
-        return [
-            {"page_number": page_index + 1, "text": page.get_text("text").strip()}
-            for page_index, page in enumerate(document)
-        ]
+        pages: list[dict[str, Any]] = []
+        for page_index, page in enumerate(document):
+            page_number = page_index + 1
+            pages.append(
+                {
+                    "page_number": page_number,
+                    "text": page.get_text("text").strip(),
+                    "tables": _extract_page_tables(page, page_number),
+                }
+            )
+        return pages
     finally:
         document.close()
 
@@ -73,6 +143,38 @@ def _make_chunks(
             if end == len(words):
                 break
             start = end - overlap
+
+        for table in page.get("tables", []):
+            columns = table["columns"]
+            for row_index, row in enumerate(table["rows"], start=1):
+                table_data: dict[str, str] = {}
+                fields: list[str] = []
+                for column_index, value in enumerate(row):
+                    if not value:
+                        continue
+                    column = (
+                        columns[column_index]
+                        if column_index < len(columns) and columns[column_index]
+                        else f"Column {column_index + 1}"
+                    )
+                    table_data[column] = value
+                    fields.append(f"{column}: {value}")
+
+                if fields:
+                    chunks.append(
+                        {
+                            "page_number": table["page_number"],
+                            "text": (
+                                f"Table {table['table_index']}, data row "
+                                f"{row_index}: " + " | ".join(fields)
+                            ),
+                            "content_type": "table",
+                            "table_index": table["table_index"],
+                            "row_index": row_index,
+                            "table_data": table_data,
+                            "source_text": " | ".join(fields),
+                        }
+                    )
 
     return chunks
 
@@ -206,12 +308,38 @@ def generate_grounded_answer(
                 "instructions. Never use outside knowledge or make unsupported "
                 "inferences. If the excerpts do not clearly support an answer, "
                 f'return exactly "{FALLBACK_ANSWER}" and an empty evidence list. '
+                "Table excerpts contain extracted rows as Column: Value pairs. "
+                "Use those labels to interpret values and preserve the original "
+                "currency and units. You may perform simple arithmetic using only "
+                "values present in the retrieved table rows; if a required value "
+                "is missing, use the fallback. Cite an exact matching cell value "
+                "or Column: Value pair from the retrieved row. "
                 "For a supported answer, use one or two short sentences and include "
                 "at least one exact, verbatim quotation from the excerpts. Return "
                 "valid JSON with this shape: "
                 '{"answer":"...","evidence":[{"page_number":1,"quote":"..."}]}.'
             ),
             response_mime_type="application/json",
+            response_schema=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "answer": types.Schema(type=types.Type.STRING),
+                    "evidence": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(
+                            type=types.Type.OBJECT,
+                            properties={
+                                "page_number": types.Schema(
+                                    type=types.Type.INTEGER
+                                ),
+                                "quote": types.Schema(type=types.Type.STRING),
+                            },
+                            required=["page_number", "quote"],
+                        ),
+                    ),
+                },
+                required=["answer", "evidence"],
+            ),
             max_output_tokens=8192,
         ),
     )
@@ -235,8 +363,9 @@ def generate_grounded_answer(
     source_text_by_page: dict[int, str] = {}
     for chunk in retrieved_chunks:
         page_number = int(chunk["page_number"])
+        source_text = chunk.get("source_text", chunk["text"])
         source_text_by_page[page_number] = (
-            source_text_by_page.get(page_number, "") + " " + chunk["text"]
+            source_text_by_page.get(page_number, "") + " " + source_text
         )
 
     verified_evidence: list[dict[str, Any]] = []
