@@ -20,6 +20,8 @@ from pptx import Presentation
 # ============================================================
 
 FALLBACK_ANSWER = "Cannot determine from the document."
+GENERATION_MODEL = "gemini-3.8-flash"
+EMBEDDING_MODEL = "gemini-embedding-001"
 
 
 # ============================================================
@@ -49,6 +51,16 @@ def create_gemini_client(api_key=None):
     return genai.Client(api_key=api_key)
 
 
+def _busy_error(exc):
+    """Return a friendly RuntimeError for 503 errors, else None."""
+    if "503" in str(exc):
+        return RuntimeError(
+            "Gemini is temporarily busy. "
+            "Please try again in a few seconds."
+        )
+    return None
+
+
 # ============================================================
 # PDF EXTRACTION
 # ============================================================
@@ -57,31 +69,14 @@ def _extract_page_tables(page):
     tables = []
 
     try:
-        finder = page.find_tables(
-            strategy="lines"
-        )
-
-        found_tables = getattr(
-            finder,
-            "tables",
-            []
-        )
+        finder = page.find_tables(strategy="lines")
+        found_tables = getattr(finder, "tables", [])
 
         if not found_tables:
-            finder = page.find_tables(
-                strategy="text"
-            )
+            finder = page.find_tables(strategy="text")
+            found_tables = getattr(finder, "tables", [])
 
-            found_tables = getattr(
-                finder,
-                "tables",
-                []
-            )
-
-        for table_index, table in enumerate(
-            found_tables,
-            start=1
-        ):
+        for table_index, table in enumerate(found_tables, start=1):
             try:
                 data = table.extract()
 
@@ -91,15 +86,10 @@ def _extract_page_tables(page):
                 cleaned_rows = []
 
                 for row in data:
-                    cleaned_row = [
-                        _normalized_text(cell)
-                        for cell in row
-                    ]
+                    cleaned_row = [_normalized_text(cell) for cell in row]
 
                     if any(cleaned_row):
-                        cleaned_rows.append(
-                            cleaned_row
-                        )
+                        cleaned_rows.append(cleaned_row)
 
                 if cleaned_rows:
                     tables.append(
@@ -121,23 +111,12 @@ def _extract_page_tables(page):
 def extract_pdf_pages(file_bytes):
     pages = []
 
-    document = pymupdf.open(
-        stream=file_bytes,
-        filetype="pdf"
-    )
+    document = pymupdf.open(stream=file_bytes, filetype="pdf")
 
     try:
-        for page_number, page in enumerate(
-            document,
-            start=1
-        ):
-            text = _normalized_text(
-                page.get_text("text")
-            )
-
-            tables = _extract_page_tables(
-                page
-            )
+        for page_number, page in enumerate(document, start=1):
+            text = _normalized_text(page.get_text("text"))
+            tables = _extract_page_tables(page)
 
             pages.append(
                 {
@@ -160,42 +139,24 @@ def extract_pdf_pages(file_bytes):
 # ============================================================
 
 def extract_docx_document(file_bytes):
-    document = Document(
-        io.BytesIO(file_bytes)
-    )
+    document = Document(io.BytesIO(file_bytes))
 
     parts = []
 
-    # Paragraphs
     for paragraph in document.paragraphs:
-        text = _normalized_text(
-            paragraph.text
-        )
+        text = _normalized_text(paragraph.text)
 
         if text:
             parts.append(text)
 
-    # Tables
-    for table_index, table in enumerate(
-        document.tables,
-        start=1
-    ):
-        parts.append(
-            f"Table {table_index}:"
-        )
+    for table_index, table in enumerate(document.tables, start=1):
+        parts.append(f"Table {table_index}:")
 
         for row in table.rows:
-            values = [
-                _normalized_text(
-                    cell.text
-                )
-                for cell in row.cells
-            ]
+            values = [_normalized_text(cell.text) for cell in row.cells]
 
             if any(values):
-                parts.append(
-                    " | ".join(values)
-                )
+                parts.append(" | ".join(values))
 
     return [
         {
@@ -216,32 +177,21 @@ def extract_doc_document(file_bytes):
     temp_path = None
 
     try:
-        with tempfile.NamedTemporaryFile(
-            suffix=".doc",
-            delete=False
-        ) as temp_file:
-
+        with tempfile.NamedTemporaryFile(suffix=".doc", delete=False) as temp_file:
             temp_file.write(file_bytes)
             temp_path = temp_file.name
 
         result = subprocess.run(
-            [
-                "antiword",
-                temp_path
-            ],
+            ["antiword", temp_path],
             capture_output=True,
             text=True,
-            timeout=60
+            timeout=60,
         )
 
-        text = _normalized_text(
-            result.stdout
-        )
+        text = _normalized_text(result.stdout)
 
         if not text:
-            raise RuntimeError(
-                "Could not extract text from the DOC file."
-            )
+            raise RuntimeError("Could not extract text from the DOC file.")
 
         return [
             {
@@ -254,10 +204,7 @@ def extract_doc_document(file_bytes):
         ]
 
     finally:
-        if (
-            temp_path
-            and os.path.exists(temp_path)
-        ):
+        if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
 
@@ -265,14 +212,8 @@ def extract_doc_document(file_bytes):
 # TXT / MD
 # ============================================================
 
-def extract_text_document(
-    file_bytes,
-    extension
-):
-    text = file_bytes.decode(
-        "utf-8",
-        errors="replace"
-    )
+def extract_text_document(file_bytes, extension):
+    text = file_bytes.decode("utf-8", errors="replace")
 
     return [
         {
@@ -290,33 +231,17 @@ def extract_text_document(
 # ============================================================
 
 def extract_csv_document(file_bytes):
-    dataframe = pd.read_csv(
-        io.BytesIO(file_bytes)
-    )
+    dataframe = pd.read_csv(io.BytesIO(file_bytes))
 
     lines = []
 
     lines.append(
-        "Columns: "
-        + ", ".join(
-            str(column)
-            for column in dataframe.columns
-        )
+        "Columns: " + ", ".join(str(column) for column in dataframe.columns)
     )
 
     for row_number, row in dataframe.iterrows():
-
-        values = []
-
-        for column in dataframe.columns:
-            values.append(
-                f"{column}={row[column]}"
-            )
-
-        lines.append(
-            f"Row {row_number + 1}: "
-            + " | ".join(values)
-        )
+        values = [f"{column}={row[column]}" for column in dataframe.columns]
+        lines.append(f"Row {row_number + 1}: " + " | ".join(values))
 
     return [
         {
@@ -333,52 +258,25 @@ def extract_csv_document(file_bytes):
 # EXCEL
 # ============================================================
 
-def _extract_excel_workbook(
-    file_bytes,
-    engine
-):
-    excel = pd.ExcelFile(
-        io.BytesIO(file_bytes),
-        engine=engine
-    )
+def _extract_excel_workbook(file_bytes, engine):
+    excel = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
 
     pages = []
 
-    for sheet_number, sheet_name in enumerate(
-        excel.sheet_names,
-        start=1
-    ):
-        dataframe = pd.read_excel(
-            excel,
-            sheet_name=sheet_name
-        )
+    for sheet_number, sheet_name in enumerate(excel.sheet_names, start=1):
+        dataframe = pd.read_excel(excel, sheet_name=sheet_name)
 
-        lines = [
-            f"Sheet: {sheet_name}"
-        ]
+        lines = [f"Sheet: {sheet_name}"]
 
         if len(dataframe.columns) > 0:
             lines.append(
                 "Columns: "
-                + ", ".join(
-                    str(column)
-                    for column in dataframe.columns
-                )
+                + ", ".join(str(column) for column in dataframe.columns)
             )
 
         for row_number, row in dataframe.iterrows():
-
-            values = []
-
-            for column in dataframe.columns:
-                values.append(
-                    f"{column}={row[column]}"
-                )
-
-            lines.append(
-                f"Row {row_number + 1}: "
-                + " | ".join(values)
-            )
+            values = [f"{column}={row[column]}" for column in dataframe.columns]
+            lines.append(f"Row {row_number + 1}: " + " | ".join(values))
 
         pages.append(
             {
@@ -386,9 +284,7 @@ def _extract_excel_workbook(
                 "text": "\n".join(lines),
                 "tables": [],
                 "content_type": "excel",
-                "source_label": (
-                    f"Excel sheet: {sheet_name}"
-                ),
+                "source_label": f"Excel sheet: {sheet_name}",
             }
         )
 
@@ -396,17 +292,11 @@ def _extract_excel_workbook(
 
 
 def extract_xlsx_document(file_bytes):
-    return _extract_excel_workbook(
-        file_bytes,
-        "openpyxl"
-    )
+    return _extract_excel_workbook(file_bytes, "openpyxl")
 
 
 def extract_xls_document(file_bytes):
-    return _extract_excel_workbook(
-        file_bytes,
-        "xlrd"
-    )
+    return _extract_excel_workbook(file_bytes, "xlrd")
 
 
 # ============================================================
@@ -414,50 +304,27 @@ def extract_xls_document(file_bytes):
 # ============================================================
 
 def extract_pptx_document(file_bytes):
-    presentation = Presentation(
-        io.BytesIO(file_bytes)
-    )
+    presentation = Presentation(io.BytesIO(file_bytes))
 
     pages = []
 
-    for slide_number, slide in enumerate(
-        presentation.slides,
-        start=1
-    ):
+    for slide_number, slide in enumerate(presentation.slides, start=1):
         texts = []
 
         for shape in slide.shapes:
 
-            # Normal text
             if hasattr(shape, "text"):
-                text = _normalized_text(
-                    shape.text
-                )
+                text = _normalized_text(shape.text)
 
                 if text:
                     texts.append(text)
 
-            # Tables inside PPTX
-            if getattr(
-                shape,
-                "has_table",
-                False
-            ):
+            if getattr(shape, "has_table", False):
                 for row in shape.table.rows:
-
-                    values = []
-
-                    for cell in row.cells:
-                        values.append(
-                            _normalized_text(
-                                cell.text
-                            )
-                        )
+                    values = [_normalized_text(cell.text) for cell in row.cells]
 
                     if any(values):
-                        texts.append(
-                            " | ".join(values)
-                        )
+                        texts.append(" | ".join(values))
 
         pages.append(
             {
@@ -465,9 +332,7 @@ def extract_pptx_document(file_bytes):
                 "text": "\n".join(texts),
                 "tables": [],
                 "content_type": "pptx",
-                "source_label": (
-                    f"PowerPoint slide {slide_number}"
-                ),
+                "source_label": f"PowerPoint slide {slide_number}",
             }
         )
 
@@ -481,26 +346,13 @@ def extract_pptx_document(file_bytes):
 def extract_ppt_document(file_bytes):
     temp_dir = tempfile.mkdtemp()
 
-    ppt_path = os.path.join(
-        temp_dir,
-        "input.ppt"
-    )
-
-    converted_path = os.path.join(
-        temp_dir,
-        "input.pptx"
-    )
+    ppt_path = os.path.join(temp_dir, "input.ppt")
+    converted_path = os.path.join(temp_dir, "input.pptx")
 
     try:
-
-        # Save original PPT
-        with open(
-            ppt_path,
-            "wb"
-        ) as file:
+        with open(ppt_path, "wb") as file:
             file.write(file_bytes)
 
-        # Convert PPT → PPTX
         result = subprocess.run(
             [
                 "libreoffice",
@@ -513,34 +365,22 @@ def extract_ppt_document(file_bytes):
             ],
             capture_output=True,
             text=True,
-            timeout=120
+            timeout=120,
         )
 
-        if not os.path.exists(
-            converted_path
-        ):
+        if not os.path.exists(converted_path):
             raise RuntimeError(
                 "Could not convert PPT to PPTX. "
-                f"LibreOffice output: {result.stdout} "
-                f"{result.stderr}"
+                f"LibreOffice output: {result.stdout} {result.stderr}"
             )
 
-        # Read converted PPTX
-        with open(
-            converted_path,
-            "rb"
-        ) as file:
+        with open(converted_path, "rb") as file:
             pptx_bytes = file.read()
 
-        return extract_pptx_document(
-            pptx_bytes
-        )
+        return extract_pptx_document(pptx_bytes)
 
     finally:
-        shutil.rmtree(
-            temp_dir,
-            ignore_errors=True
-        )
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 # ============================================================
@@ -548,18 +388,11 @@ def extract_ppt_document(file_bytes):
 # ============================================================
 
 def extract_json_document(file_bytes):
-    text = file_bytes.decode(
-        "utf-8",
-        errors="replace"
-    )
+    text = file_bytes.decode("utf-8", errors="replace")
 
     data = json.loads(text)
 
-    formatted = json.dumps(
-        data,
-        indent=2,
-        ensure_ascii=False
-    )
+    formatted = json.dumps(data, indent=2, ensure_ascii=False)
 
     return [
         {
@@ -576,146 +409,53 @@ def extract_json_document(file_bytes):
 # UNIVERSAL DOCUMENT EXTRACTION
 # ============================================================
 
-def extract_document(
-    file_bytes,
-    extension
-):
+def extract_document(file_bytes, extension):
     """
     Extract content from supported file formats.
 
-    IMPORTANT:
-    extension should be something like:
-        pdf
-        doc
-        docx
-        xls
-        xlsx
-        ppt
-        pptx
+    extension can be "xlsx", ".xlsx" or a full filename like "data.xlsx".
     """
 
-    # Clean extension
-    extension = str(
-        extension
-    ).lower().strip()
-
+    extension = str(extension).lower().strip()
     extension = extension.lstrip(".")
 
-    # Handle accidental full filename
     if "." in extension:
-        extension = extension.rsplit(
-            ".",
-            1
-        )[-1]
-
-    # --------------------------------------------------------
-    # PDF
-    # --------------------------------------------------------
+        extension = extension.rsplit(".", 1)[-1]
 
     if extension == "pdf":
-        return extract_pdf_pages(
-            file_bytes
-        )
-
-    # --------------------------------------------------------
-    # DOCX
-    # --------------------------------------------------------
+        return extract_pdf_pages(file_bytes)
 
     if extension == "docx":
-        return extract_docx_document(
-            file_bytes
-        )
-
-    # --------------------------------------------------------
-    # DOC
-    # --------------------------------------------------------
+        return extract_docx_document(file_bytes)
 
     if extension == "doc":
-        return extract_doc_document(
-            file_bytes
-        )
-
-    # --------------------------------------------------------
-    # TXT
-    # --------------------------------------------------------
+        return extract_doc_document(file_bytes)
 
     if extension == "txt":
-        return extract_text_document(
-            file_bytes,
-            "txt"
-        )
-
-    # --------------------------------------------------------
-    # MARKDOWN
-    # --------------------------------------------------------
+        return extract_text_document(file_bytes, "txt")
 
     if extension == "md":
-        return extract_text_document(
-            file_bytes,
-            "md"
-        )
-
-    # --------------------------------------------------------
-    # CSV
-    # --------------------------------------------------------
+        return extract_text_document(file_bytes, "md")
 
     if extension == "csv":
-        return extract_csv_document(
-            file_bytes
-        )
-
-    # --------------------------------------------------------
-    # XLSX
-    # --------------------------------------------------------
+        return extract_csv_document(file_bytes)
 
     if extension == "xlsx":
-        return extract_xlsx_document(
-            file_bytes
-        )
-
-    # --------------------------------------------------------
-    # XLS
-    # --------------------------------------------------------
+        return extract_xlsx_document(file_bytes)
 
     if extension == "xls":
-        return extract_xls_document(
-            file_bytes
-        )
-
-    # --------------------------------------------------------
-    # PPTX
-    # --------------------------------------------------------
+        return extract_xls_document(file_bytes)
 
     if extension == "pptx":
-        return extract_pptx_document(
-            file_bytes
-        )
-
-    # --------------------------------------------------------
-    # PPT
-    # --------------------------------------------------------
+        return extract_pptx_document(file_bytes)
 
     if extension == "ppt":
-        return extract_ppt_document(
-            file_bytes
-        )
-
-    # --------------------------------------------------------
-    # JSON
-    # --------------------------------------------------------
+        return extract_ppt_document(file_bytes)
 
     if extension == "json":
-        return extract_json_document(
-            file_bytes
-        )
+        return extract_json_document(file_bytes)
 
-    # --------------------------------------------------------
-    # Unsupported
-    # --------------------------------------------------------
-
-    raise ValueError(
-        f"Unsupported document format: .{extension}"
-    )
+    raise ValueError(f"Unsupported document format: .{extension}")
 
 
 # ============================================================
@@ -728,11 +468,9 @@ def _make_chunks(
     content_type="text",
     source_label="Document",
     chunk_size=1200,
-    overlap=200
+    overlap=200,
 ):
-    text = _normalized_text(
-        text
-    )
+    text = _normalized_text(text)
 
     if not text:
         return []
@@ -743,20 +481,12 @@ def _make_chunks(
     text_length = len(text)
 
     while start < text_length:
-
-        end = min(
-            start + chunk_size,
-            text_length
-        )
-
-        chunk_text = text[
-            start:end
-        ]
+        end = min(start + chunk_size, text_length)
 
         chunks.append(
             {
                 "page_number": page_number,
-                "text": chunk_text,
+                "text": text[start:end],
                 "content_type": content_type,
                 "source_label": source_label,
             }
@@ -765,10 +495,7 @@ def _make_chunks(
         if end >= text_length:
             break
 
-        start = max(
-            end - overlap,
-            start + 1
-        )
+        start = max(end - overlap, start + 1)
 
     return chunks
 
@@ -777,70 +504,28 @@ def chunk_document_pages(pages):
     chunks = []
 
     for page in pages:
-
-        page_number = page.get(
-            "page_number",
-            1
-        )
-
-        source_label = page.get(
-            "source_label",
-            "Document"
-        )
-
-        text = page.get(
-            "text",
-            ""
-        )
-
-        content_type = page.get(
-            "content_type",
-            "text"
-        )
-
-        # Normal text chunks
-        page_chunks = _make_chunks(
-            text=text,
-            page_number=page_number,
-            content_type=content_type,
-            source_label=source_label
-        )
+        page_number = page.get("page_number", 1)
+        source_label = page.get("source_label", "Document")
+        text = page.get("text", "")
+        content_type = page.get("content_type", "text")
 
         chunks.extend(
-            page_chunks
+            _make_chunks(
+                text=text,
+                page_number=page_number,
+                content_type=content_type,
+                source_label=source_label,
+            )
         )
 
-        # PDF tables
-        for table in page.get(
-            "tables",
-            []
-        ):
+        for table in page.get("tables", []):
+            table_index = table.get("table_index", 1)
+            rows = table.get("data", [])
 
-            table_index = table.get(
-                "table_index",
-                1
-            )
-
-            rows = table.get(
-                "data",
-                []
-            )
-
-            for row_index, row in enumerate(
-                rows,
-                start=1
-            ):
-
+            for row_index, row in enumerate(rows, start=1):
                 row_text = (
-                    f"Table {table_index}, "
-                    f"data row {row_index}: "
-                    +
-                    " | ".join(
-                        _normalized_text(
-                            value
-                        )
-                        for value in row
-                    )
+                    f"Table {table_index}, data row {row_index}: "
+                    + " | ".join(_normalized_text(value) for value in row)
                 )
 
                 chunks.append(
@@ -862,52 +547,30 @@ def chunk_document_pages(pages):
 # GEMINI EMBEDDINGS
 # ============================================================
 
-def _embed_texts(
-    client,
-    texts,
-    task_type
-):
+def _embed_texts(client, texts, task_type):
     if not texts:
         return []
 
     embeddings = []
 
     for text in texts:
-
         result = client.models.embed_content(
-            model="gemini-embedding-001",
+            model=EMBEDDING_MODEL,
             contents=text,
-            config=types.EmbedContentConfig(
-                task_type=task_type
-            )
+            config=types.EmbedContentConfig(task_type=task_type),
         )
 
-        embeddings.append(
-            result.embeddings[0].values
-        )
+        embeddings.append(result.embeddings[0].values)
 
     return embeddings
 
 
-def embed_document_chunks(
-    client,
-    chunks
-):
-    texts = [
-        chunk["text"]
-        for chunk in chunks
-    ]
+def embed_document_chunks(client, chunks):
+    texts = [chunk["text"] for chunk in chunks]
 
-    embeddings = _embed_texts(
-        client,
-        texts,
-        "RETRIEVAL_DOCUMENT"
-    )
+    embeddings = _embed_texts(client, texts, "RETRIEVAL_DOCUMENT")
 
-    for chunk, embedding in zip(
-        chunks,
-        embeddings
-    ):
+    for chunk, embedding in zip(chunks, embeddings):
         chunk["embedding"] = embedding
 
     return chunks
@@ -917,99 +580,50 @@ def embed_document_chunks(
 # COSINE SIMILARITY
 # ============================================================
 
-def _cosine_similarity(
-    vector_a,
-    vector_b
-):
+def _cosine_similarity(vector_a, vector_b):
     if not vector_a or not vector_b:
         return 0.0
 
-    dot_product = sum(
-        a * b
-        for a, b in zip(
-            vector_a,
-            vector_b
-        )
-    )
+    dot_product = sum(a * b for a, b in zip(vector_a, vector_b))
 
-    magnitude_a = math.sqrt(
-        sum(
-            a * a
-            for a in vector_a
-        )
-    )
+    magnitude_a = math.sqrt(sum(a * a for a in vector_a))
+    magnitude_b = math.sqrt(sum(b * b for b in vector_b))
 
-    magnitude_b = math.sqrt(
-        sum(
-            b * b
-            for b in vector_b
-        )
-    )
-
-    if (
-        magnitude_a == 0
-        or magnitude_b == 0
-    ):
+    if magnitude_a == 0 or magnitude_b == 0:
         return 0.0
 
-    return dot_product / (
-        magnitude_a * magnitude_b
-    )
+    return dot_product / (magnitude_a * magnitude_b)
 
 
 # ============================================================
 # RETRIEVAL
 # ============================================================
 
-def retrieve_relevant_content(
-    client,
-    chunks,
-    question,
-    top_k=6
-):
+def retrieve_relevant_content(client, chunks, question, top_k=6):
     if not chunks:
         return []
 
     query_result = client.models.embed_content(
-        model="gemini-embedding-001",
+        model=EMBEDDING_MODEL,
         contents=question,
-        config=types.EmbedContentConfig(
-            task_type="RETRIEVAL_QUERY"
-        )
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
     )
 
-    query_embedding = (
-        query_result.embeddings[0].values
-    )
+    query_embedding = query_result.embeddings[0].values
 
     scored_chunks = []
 
     for chunk in chunks:
-
-        embedding = chunk.get(
-            "embedding"
-        )
+        embedding = chunk.get("embedding")
 
         if not embedding:
             continue
 
-        score = _cosine_similarity(
-            query_embedding,
-            embedding
-        )
-
         item = dict(chunk)
+        item["score"] = _cosine_similarity(query_embedding, embedding)
+        scored_chunks.append(item)
 
-        item["score"] = score
-
-        scored_chunks.append(
-            item
-        )
-
-    scored_chunks.sort(
-        key=lambda item: item["score"],
-        reverse=True
-    )
+    scored_chunks.sort(key=lambda item: item["score"], reverse=True)
 
     return scored_chunks[:top_k]
 
@@ -1018,24 +632,13 @@ def retrieve_relevant_content(
 # GROUNDED ANSWER
 # ============================================================
 
-def generate_grounded_answer(
-    client,
-    question,
-    retrieved_content
-):
+def generate_grounded_answer(client, question, retrieved_content):
     if not retrieved_content:
-        return {
-            "answer": FALLBACK_ANSWER,
-            "evidence": []
-        }
+        return {"answer": FALLBACK_ANSWER, "evidence": []}
 
     excerpts = []
 
-    for index, item in enumerate(
-        retrieved_content,
-        start=1
-    ):
-
+    for index, item in enumerate(retrieved_content, start=1):
         excerpts.append(
             f"""
 SOURCE {index}
@@ -1047,9 +650,7 @@ Content:
 """
         )
 
-    context = "\n".join(
-        excerpts
-    )
+    context = "\n".join(excerpts)
 
     prompt = f"""
 You are EviNex AI,
@@ -1084,127 +685,71 @@ RULES:
     schema = types.Schema(
         type=types.Type.OBJECT,
         properties={
-            "answer": types.Schema(
-                type=types.Type.STRING
-            ),
+            "answer": types.Schema(type=types.Type.STRING),
             "evidence": types.Schema(
                 type=types.Type.ARRAY,
                 items=types.Schema(
                     type=types.Type.OBJECT,
                     properties={
-                        "quote": types.Schema(
-                            type=types.Type.STRING
-                        ),
-                        "page_number": types.Schema(
-                            type=types.Type.INTEGER
-                        )
+                        "quote": types.Schema(type=types.Type.STRING),
+                        "page_number": types.Schema(type=types.Type.INTEGER),
                     },
-                    required=[
-                        "quote",
-                        "page_number"
-                    ]
-                )
-            )
+                    required=["quote", "page_number"],
+                ),
+            ),
         },
-        required=[
-            "answer",
-            "evidence"
-        ]
+        required=["answer", "evidence"],
     )
 
     try:
-
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=GENERATION_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0,
                 response_mime_type="application/json",
-                response_schema=schema
-            )
+                response_schema=schema,
+            ),
         )
 
-        result = json.loads(
-            response.text
-        )
+        result = json.loads(response.text)
 
-        answer = result.get(
-            "answer",
-            FALLBACK_ANSWER
-        )
-
-        evidence = result.get(
-            "evidence",
-            []
-        )
+        answer = result.get("answer", FALLBACK_ANSWER)
+        evidence = result.get("evidence", [])
 
         verified_evidence = []
 
         for evidence_item in evidence:
-
-            quote = _normalized_text(
-                evidence_item.get(
-                    "quote",
-                    ""
-                )
-            )
-
-            page_number = evidence_item.get(
-                "page_number"
-            )
+            quote = _normalized_text(evidence_item.get("quote", ""))
+            page_number = evidence_item.get("page_number")
 
             if not quote:
                 continue
 
             for source in retrieved_content:
-
-                if (
-                    source.get("page_number")
-                    != page_number
-                ):
+                if source.get("page_number") != page_number:
                     continue
 
-                source_text = _normalized_text(
-                    source.get(
-                        "text",
-                        ""
-                    )
-                )
+                source_text = _normalized_text(source.get("text", ""))
 
                 if quote in source_text:
-
                     verified_evidence.append(
                         {
                             "quote": quote,
                             "page_number": page_number,
-                            "source_label": source.get(
-                                "source_label",
-                                "Document"
-                            ),
-                            "score": source.get(
-                                "score",
-                                0
-                            )
+                            "source_label": source.get("source_label", "Document"),
+                            "score": source.get("score", 0),
                         }
                     )
-
                     break
 
-        return {
-            "answer": answer,
-            "evidence": verified_evidence
-        }
+        return {"answer": answer, "evidence": verified_evidence}
 
     except Exception as exc:
+        busy = _busy_error(exc)
 
-        error_text = str(exc)
-
-        if "503" in error_text:
-
-            raise RuntimeError(
-                "Gemini is temporarily busy. "
-                "Please try again in a few seconds."
-            )
+        if busy:
+            raise busy
 
         raise
 
@@ -1213,31 +758,15 @@ RULES:
 # SCANNED PDF
 # ============================================================
 
-def generate_scanned_pdf_answer(
-    client,
-    pdf_bytes,
-    question
-):
+def generate_scanned_pdf_answer(client, pdf_bytes, question):
     temp_path = None
 
     try:
-
-        # Save PDF temporarily
-        with tempfile.NamedTemporaryFile(
-            suffix=".pdf",
-            delete=False
-        ) as temp_file:
-
-            temp_file.write(
-                pdf_bytes
-            )
-
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temp_file:
+            temp_file.write(pdf_bytes)
             temp_path = temp_file.name
 
-        # Upload PDF to Gemini
-        uploaded_file = client.files.upload(
-            file=temp_path
-        )
+        uploaded_file = client.files.upload(file=temp_path)
 
         prompt = f"""
 You are EviNex AI.
@@ -1268,40 +797,23 @@ RULES:
 """
 
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                uploaded_file,
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0
-            )
+            model=GENERATION_MODEL,
+            contents=[uploaded_file, prompt],
+            config=types.GenerateContentConfig(temperature=0),
         )
 
-        return {
-            "answer": response.text,
-            "evidence": []
-        }
+        return {"answer": response.text, "evidence": []}
 
     except Exception as exc:
+        busy = _busy_error(exc)
 
-        error_text = str(exc)
-
-        if "503" in error_text:
-
-            raise RuntimeError(
-                "Gemini is temporarily busy. "
-                "Please try again in a few seconds."
-            )
+        if busy:
+            raise busy
 
         raise
 
     finally:
-
-        if (
-            temp_path
-            and os.path.exists(temp_path)
-        ):
+        if temp_path and os.path.exists(temp_path):
             os.remove(temp_path)
 
 
@@ -1309,12 +821,7 @@ RULES:
 # IMAGE QUESTION ANSWERING
 # ============================================================
 
-def generate_image_answer(
-    client,
-    image_bytes,
-    mime_type,
-    question
-):
+def generate_image_answer(client, image_bytes, mime_type, question):
     prompt = f"""
 You are EviNex AI,
 an evidence-grounded multimodal
@@ -1342,38 +849,21 @@ RULES:
    - numbers
 """
 
-    image_part = types.Part.from_bytes(
-        data=image_bytes,
-        mime_type=mime_type
-    )
+    image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
 
     try:
-
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
-            contents=[
-                image_part,
-                prompt
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0
-            )
+            model=GENERATION_MODEL,
+            contents=[image_part, prompt],
+            config=types.GenerateContentConfig(temperature=0),
         )
 
-        return {
-            "answer": response.text,
-            "evidence": []
-        }
+        return {"answer": response.text, "evidence": []}
 
     except Exception as exc:
+        busy = _busy_error(exc)
 
-        error_text = str(exc)
-
-        if "503" in error_text:
-
-            raise RuntimeError(
-                "Gemini is temporarily busy. "
-                "Please try again in a few seconds."
-            )
+        if busy:
+            raise busy
 
         raise
