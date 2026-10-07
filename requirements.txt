@@ -1,9 +1,12 @@
 streamlit
+python-dotenv
 google-genai
-PyMuPDF
+pymupdf
 python-docx
-openpyxl
-xlrd
 python-pptx
 pandas
-python-dotenv
+openpyxl
+xlrd
+matplotlib
+numpy
+ 
