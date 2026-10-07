@@ -590,6 +590,29 @@ def chunk_document_pages(pages):
 # GEMINI EMBEDDINGS
 # ============================================================
 
+def _embed_with_retry(client, text, task_type):
+    """embed_content with waiting retries for free-tier per-minute limits."""
+    last_exc = None
+
+    for attempt in range(3):
+        try:
+            result = client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=text,
+                config=types.EmbedContentConfig(task_type=task_type),
+            )
+            return result.embeddings[0].values
+        except Exception as exc:
+            last_exc = exc
+
+            if not _is_busy(exc):
+                raise
+
+            time.sleep(30)
+
+    raise last_exc
+
+
 def _embed_texts(client, texts, task_type):
     if not texts:
         return []
@@ -597,13 +620,7 @@ def _embed_texts(client, texts, task_type):
     embeddings = []
 
     for text in texts:
-        result = client.models.embed_content(
-            model=EMBEDDING_MODEL,
-            contents=text,
-            config=types.EmbedContentConfig(task_type=task_type),
-        )
-
-        embeddings.append(result.embeddings[0].values)
+        embeddings.append(_embed_with_retry(client, text, task_type))
 
     return embeddings
 
@@ -646,13 +663,7 @@ def retrieve_relevant_content(client, chunks, question, top_k=6):
     if not chunks:
         return []
 
-    query_result = client.models.embed_content(
-        model=EMBEDDING_MODEL,
-        contents=question,
-        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
-    )
-
-    query_embedding = query_result.embeddings[0].values
+    query_embedding = _embed_with_retry(client, question, "RETRIEVAL_QUERY")
 
     scored_chunks = []
 
