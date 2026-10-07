@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import os
 
 import streamlit as st
@@ -18,6 +19,7 @@ from pdf_processor import (
     generate_grounded_answer,
     generate_image_answer,
     generate_scanned_pdf_answer,
+    render_pdf_page,
     retrieve_relevant_content,
 )
 
@@ -32,12 +34,10 @@ MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
 PREVIEW_CHARACTER_LIMIT = 5000
 
 # Documents with less text than this are sent to Gemini in full.
-# This is more accurate than retrieval for small files such as spreadsheets,
-# and it allows questions that need totals, counts or comparisons.
 FULL_CONTEXT_CHAR_LIMIT = 200_000
 
 # PDFs with at most this many pages are sent to Gemini as the original file,
-# so it can read charts, diagrams and scanned pages, and no embeddings are used.
+# so it can read charts, diagrams and scanned pages.
 PDF_DIRECT_MAX_PAGES = 40
 
 SUPPORTED_TYPES = [
@@ -73,14 +73,36 @@ def get_client():
     return create_gemini_client(api_key)
 
 
-def make_result(question, answer, evidence, error, document_hash):
+def make_result(
+    question,
+    answer,
+    evidence,
+    error,
+    document_hash,
+    chart=None,
+    show_pages=None,
+):
     return {
         "question": question,
         "answer": answer,
         "evidence": evidence,
         "error": error,
         "document_hash": document_hash,
+        "chart": chart,
+        "show_pages": show_pages or [],
     }
+
+
+def result_from_answer(question, answer, document_hash):
+    return make_result(
+        question,
+        answer.get("answer"),
+        answer.get("evidence", []),
+        None,
+        document_hash,
+        chart=answer.get("chart"),
+        show_pages=answer.get("show_pages", []),
+    )
 
 
 def friendly_error(exc):
@@ -93,6 +115,148 @@ def friendly_error(exc):
         )
 
     return f"Gemini could not complete the request: {text}"
+
+
+# ============================================================
+# CHART AND IMAGE OUTPUT
+# ============================================================
+
+def render_chart(chart):
+    """Draw a chart returned by Gemini and offer a PNG download."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    categories = chart["categories"]
+    series = chart["series"]
+    chart_type = chart["chart_type"]
+
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    if chart_type == "pie":
+        ax.pie(
+            series[0]["values"],
+            labels=categories,
+            autopct="%1.1f%%",
+            startangle=90,
+        )
+        ax.axis("equal")
+
+    elif chart_type == "line":
+        for item in series:
+            ax.plot(categories, item["values"], marker="o", label=item["name"])
+
+            for x_value, y_value in zip(categories, item["values"]):
+                ax.annotate(
+                    f"{y_value:g}",
+                    (x_value, y_value),
+                    textcoords="offset points",
+                    xytext=(0, 6),
+                    ha="center",
+                    fontsize=8,
+                )
+
+    else:
+        positions = np.arange(len(categories))
+        count = len(series)
+        width = 0.8 / count
+
+        for index, item in enumerate(series):
+            offset = (index - (count - 1) / 2) * width
+
+            bars = ax.bar(
+                positions + offset,
+                item["values"],
+                width,
+                label=item["name"],
+            )
+
+            ax.bar_label(bars, fmt="%g", fontsize=8, padding=2)
+
+        ax.set_xticks(positions)
+        ax.set_xticklabels(categories)
+
+    if chart_type != "pie":
+        ax.set_xlabel(chart.get("x_label", ""))
+        ax.set_ylabel(chart.get("y_label", ""))
+        ax.spines[["top", "right"]].set_visible(False)
+
+        if len(series) > 1:
+            ax.legend()
+
+    if chart.get("title"):
+        ax.set_title(chart["title"], fontweight="bold")
+
+    fig.tight_layout()
+
+    st.pyplot(fig)
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", dpi=200, bbox_inches="tight")
+    plt.close(fig)
+
+    st.download_button(
+        "Download chart (PNG)",
+        data=buffer.getvalue(),
+        file_name="evinex_chart.png",
+        mime="image/png",
+    )
+
+
+def display_result(result, filename, file_bytes, extension, pages=None):
+    """Show the answer, optional chart, optional page images and evidence."""
+    st.divider()
+    st.subheader("AI Answer")
+
+    if result.get("error"):
+        st.error(result["error"])
+        return
+
+    st.write(result["answer"])
+
+    # ---------------- chart ----------------
+    chart = result.get("chart")
+
+    if chart:
+        st.subheader("Chart")
+
+        try:
+            render_chart(chart)
+        except Exception as exc:
+            st.warning(f"The chart could not be drawn: {exc}")
+
+    # ---------------- page images (PDF only) ----------------
+    show_pages = result.get("show_pages") or []
+
+    if show_pages and extension == ".pdf":
+        st.subheader("Referenced pages")
+
+        for page_number in show_pages:
+            image = render_pdf_page(file_bytes, page_number)
+
+            if image:
+                st.image(
+                    image,
+                    caption=f"{filename} · Page {page_number}",
+                    use_container_width=True,
+                )
+
+    # ---------------- evidence ----------------
+    evidence = result.get("evidence", [])
+
+    if evidence:
+        st.subheader("Evidence")
+
+        for item in evidence:
+            st.write(f'"{item["quote"]}"')
+
+            page_number = item["page_number"]
+            source_label = item.get("source_label") or f"Page {page_number}"
+
+            st.caption(f"Source: {filename} · {source_label}")
 
 
 # ============================================================
@@ -109,7 +273,8 @@ st.title("EviNex AI")
 
 st.write(
     "Upload a document and ask a question. "
-    "Answers are based only on the document."
+    "Answers are based only on the document. "
+    "Ask for a chart or to see a figure and the answer will include it."
 )
 
 
@@ -175,7 +340,6 @@ if extension in (".png", ".jpg", ".jpeg"):
                         "image/png" if extension == ".png" else "image/jpeg"
                     )
 
-                    # Order: client, image_bytes, mime_type, question
                     answer = generate_image_answer(
                         client,
                         file_bytes,
@@ -183,43 +347,19 @@ if extension in (".png", ".jpg", ".jpeg"):
                         question.strip(),
                     )
 
-                st.session_state["answer_result"] = make_result(
-                    question.strip(),
-                    answer["answer"],
-                    answer["evidence"],
-                    None,
-                    document_hash,
+                st.session_state["answer_result"] = result_from_answer(
+                    question.strip(), answer, document_hash
                 )
 
             except Exception as exc:
                 st.session_state["answer_result"] = make_result(
-                    question.strip(),
-                    None,
-                    [],
-                    friendly_error(exc),
-                    document_hash,
+                    question.strip(), None, [], friendly_error(exc), document_hash
                 )
 
     result = st.session_state.get("answer_result")
 
     if result and result.get("document_hash") == document_hash:
-        st.divider()
-        st.subheader("AI Answer")
-
-        if result.get("error"):
-            st.error(result["error"])
-        else:
-            st.write(result["answer"])
-
-            evidence = result.get("evidence", [])
-
-            if evidence:
-                st.subheader("Evidence")
-                for item in evidence:
-                    st.write(f'"{item["quote"]}"')
-                    st.caption(
-                        f"Source: {filename} · Page {item['page_number']}"
-                    )
+        display_result(result, filename, file_bytes, extension)
 
     st.stop()
 
@@ -295,14 +435,13 @@ with st.expander("Extracted text preview", expanded=False):
 
 
 # ============================================================
-# SCANNED PDF DETECTION
+# SCANNED / DIRECT PDF DETECTION
 # ============================================================
 
 is_scanned_pdf = extension == ".pdf" and not bool(all_text)
 
-use_direct_pdf = (
-    extension == ".pdf"
-    and (is_scanned_pdf or len(pages) <= PDF_DIRECT_MAX_PAGES)
+use_direct_pdf = extension == ".pdf" and (
+    is_scanned_pdf or len(pages) <= PDF_DIRECT_MAX_PAGES
 )
 
 if is_scanned_pdf:
@@ -320,7 +459,9 @@ if is_scanned_pdf:
 with st.form("document_question_form"):
     question = st.text_input(
         "Ask a question about this document",
-        placeholder="For example: What conclusion does the report reach?",
+        placeholder=(
+            "For example: Show a bar chart of quarterly units produced"
+        ),
         max_chars=500,
     )
     submitted = st.form_submit_button("Ask")
@@ -341,28 +482,22 @@ if submitted:
 
                 client = get_client()
 
-                # ---------------- SCANNED PDF ----------------
+                # ---------------- PDF sent as the original file ----------------
                 if use_direct_pdf:
 
-                    # Order: client, pdf_bytes, question
                     answer = generate_scanned_pdf_answer(
                         client,
                         file_bytes,
                         question.strip(),
                     )
 
-                    answer_result = make_result(
-                        question.strip(),
-                        answer["answer"],
-                        answer["evidence"],
-                        None,
-                        document_hash,
+                    answer_result = result_from_answer(
+                        question.strip(), answer, document_hash
                     )
 
-                # ---------------- NORMAL DOCUMENT ----------------
+                # ---------------- TEXT-BASED DOCUMENT ----------------
                 else:
 
-                    # Build the full text of every page/sheet
                     full_pages = []
 
                     for page in pages:
@@ -424,30 +559,21 @@ if submitted:
                         )
 
                     else:
-                        # Order: client, question, retrieved_content
                         answer = generate_grounded_answer(
                             client,
                             question.strip(),
                             relevant_chunks,
                         )
 
-                        answer_result = make_result(
-                            question.strip(),
-                            answer["answer"],
-                            answer["evidence"],
-                            None,
-                            document_hash,
+                        answer_result = result_from_answer(
+                            question.strip(), answer, document_hash
                         )
 
                 st.session_state["answer_result"] = answer_result
 
         except Exception as exc:
             st.session_state["answer_result"] = make_result(
-                question.strip(),
-                None,
-                [],
-                friendly_error(exc),
-                document_hash,
+                question.strip(), None, [], friendly_error(exc), document_hash
             )
 
 
@@ -458,28 +584,4 @@ if submitted:
 result = st.session_state.get("answer_result")
 
 if result and result.get("document_hash") == document_hash:
-
-    st.divider()
-    st.subheader("AI Answer")
-
-    if result.get("error"):
-        st.error(result["error"])
-
-    else:
-        st.write(result["answer"])
-
-        st.subheader("Evidence")
-
-        evidence = result.get("evidence", [])
-
-        if evidence:
-            for item in evidence:
-                st.write(f'"{item["quote"]}"')
-
-                page_number = item["page_number"]
-                source_label = item.get("source_label") or f"Page {page_number}"
-
-                st.caption(f"Source: {filename} · {source_label}")
-
-        else:
-            st.caption("No supporting excerpt was found in the document.")
+    display_result(result, filename, file_bytes, extension, pages)
