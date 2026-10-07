@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 
 import pandas as pd
 import pymupdf
@@ -21,6 +22,8 @@ from pptx import Presentation
 
 FALLBACK_ANSWER = "Cannot determine from the document."
 GENERATION_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.7-flash"
+MAX_RETRIES = 4
 EMBEDDING_MODEL = "gemini-embedding-001"
 
 
@@ -51,14 +54,54 @@ def create_gemini_client(api_key=None):
     return genai.Client(api_key=api_key)
 
 
+def _is_busy(exc):
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("503", "unavailable", "overloaded", "429", "resource_exhausted")
+    )
+
+
 def _busy_error(exc):
-    """Return a friendly RuntimeError for 503 errors, else None."""
-    if "503" in str(exc):
+    """Return a friendly RuntimeError for busy/rate-limit errors, else None."""
+    if _is_busy(exc):
         return RuntimeError(
             "Gemini is temporarily busy. "
-            "Please try again in a few seconds."
+            "Please try again in a minute."
         )
     return None
+
+
+def _generate_with_retry(client, model, contents, config=None):
+    """
+    Call generate_content, retrying with exponential backoff when Gemini
+    is busy (503 / 429). After the retries on the main model fail, try the
+    fallback model once with the same retry logic.
+    """
+    models = [model]
+
+    if FALLBACK_MODEL and FALLBACK_MODEL != model:
+        models.append(FALLBACK_MODEL)
+
+    last_exc = None
+
+    for model_name in models:
+        for attempt in range(MAX_RETRIES):
+            try:
+                return client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=config,
+                )
+            except Exception as exc:
+                last_exc = exc
+
+                if not _is_busy(exc):
+                    raise
+
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s, 8s
+
+    raise last_exc
 
 
 # ============================================================
@@ -702,7 +745,8 @@ RULES:
     )
 
     try:
-        response = client.models.generate_content(
+        response = _generate_with_retry(
+            client,
             model=GENERATION_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
@@ -796,7 +840,8 @@ RULES:
    when possible.
 """
 
-        response = client.models.generate_content(
+        response = _generate_with_retry(
+            client,
             model=GENERATION_MODEL,
             contents=[uploaded_file, prompt],
             config=types.GenerateContentConfig(temperature=0),
@@ -852,7 +897,8 @@ RULES:
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
 
     try:
-        response = client.models.generate_content(
+        response = _generate_with_retry(
+            client,
             model=GENERATION_MODEL,
             contents=[image_part, prompt],
             config=types.GenerateContentConfig(temperature=0),
