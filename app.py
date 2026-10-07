@@ -49,6 +49,44 @@ SUPPORTED_TYPES = [
 
 
 # ============================================================
+# HELPERS
+# ============================================================
+
+def get_client():
+    """Create the Gemini client, using Streamlit Secrets if available."""
+    api_key = None
+
+    try:
+        api_key = st.secrets.get("GEMINI_API_KEY")
+    except Exception:
+        api_key = None
+
+    return create_gemini_client(api_key)
+
+
+def make_result(question, answer, evidence, error, document_hash):
+    return {
+        "question": question,
+        "answer": answer,
+        "evidence": evidence,
+        "error": error,
+        "document_hash": document_hash,
+    }
+
+
+def friendly_error(exc):
+    text = str(exc)
+
+    if "GEMINI_API_KEY is not available" in text:
+        return (
+            "The Gemini API key is not available to the app. "
+            "Check that GEMINI_API_KEY is saved in Streamlit Secrets."
+        )
+
+    return f"Gemini could not complete the request: {text}"
+
+
+# ============================================================
 # PAGE CONFIGURATION
 # ============================================================
 
@@ -75,14 +113,8 @@ uploaded_file = st.file_uploader(
     type=SUPPORTED_TYPES,
 )
 
-
 if uploaded_file is None:
-
-    st.info(
-        "Upload a document to see its details "
-        "and ask a question."
-    )
-
+    st.info("Upload a document to see its details and ask a question.")
     st.stop()
 
 
@@ -91,323 +123,122 @@ if uploaded_file is None:
 # ============================================================
 
 file_bytes = uploaded_file.getvalue()
-
 filename = uploaded_file.name
-
-extension = os.path.splitext(
-    filename
-)[1].lower()
-
-
-# ============================================================
-# FILE SIZE CHECK
-# ============================================================
+extension = os.path.splitext(filename)[1].lower()
 
 if len(file_bytes) > MAX_FILE_SIZE_BYTES:
-
-    st.error(
-        "This file is larger than the 20 MB limit."
-    )
-
+    st.error("This file is larger than the 20 MB limit.")
     st.stop()
 
-
-# ============================================================
-# DOCUMENT HASH
-# ============================================================
-
-document_hash = hashlib.sha256(
-    file_bytes
-).hexdigest()
+document_hash = hashlib.sha256(file_bytes).hexdigest()
 
 
 # ============================================================
 # IMAGE FILES
 # ============================================================
 
-if extension in (
-    ".png",
-    ".jpg",
-    ".jpeg",
-):
+if extension in (".png", ".jpg", ".jpeg"):
 
-    st.subheader(
-        "Document information"
-    )
+    st.subheader("Document information")
+    st.write(f"**Filename:** {filename}")
+    st.write("**Type:** Image")
 
-    st.write(
-        f"**Filename:** {filename}"
-    )
+    with st.expander("Image preview", expanded=True):
+        st.image(file_bytes, caption=filename, use_container_width=True)
 
-    st.write(
-        "**Type:** Image"
-    )
-
-    with st.expander(
-        "Image preview",
-        expanded=True,
-    ):
-
-        st.image(
-            file_bytes,
-            caption=filename,
-            use_container_width=True,
-        )
-
-
-    with st.form(
-        "image_question_form"
-    ):
-
+    with st.form("image_question_form"):
         question = st.text_input(
             "Ask a question about this image",
-            placeholder=(
-                "For example: What information "
-                "is shown in this image?"
-            ),
+            placeholder="For example: What information is shown in this image?",
             max_chars=500,
         )
-
-        submitted = st.form_submit_button(
-            "Ask"
-        )
-
+        submitted = st.form_submit_button("Ask")
 
     if submitted:
-
         if not question.strip():
-
-            st.warning(
-                "Enter a question to continue."
-            )
-
+            st.warning("Enter a question to continue.")
         else:
-
             try:
+                with st.spinner("Analyzing the image..."):
+                    client = get_client()
 
-                with st.spinner(
-                    "Analyzing the image..."
-                ):
-
-                    client = (
-                        create_gemini_client()
+                    mime_type = (
+                        "image/png" if extension == ".png" else "image/jpeg"
                     )
 
-                    answer = (
-                        generate_image_answer(
-                            file_bytes,
-                            filename,
-                            question.strip(),
-                            client,
-                        )
+                    # Order: client, image_bytes, mime_type, question
+                    answer = generate_image_answer(
+                        client,
+                        file_bytes,
+                        mime_type,
+                        question.strip(),
                     )
 
-                st.session_state[
-                    "answer_result"
-                ] = {
-                    "question": question.strip(),
-                    "answer": answer[
-                        "answer"
-                    ],
-                    "evidence": answer[
-                        "evidence"
-                    ],
-                    "error": None,
-                    "document_hash": document_hash,
-                }
+                st.session_state["answer_result"] = make_result(
+                    question.strip(),
+                    answer["answer"],
+                    answer["evidence"],
+                    None,
+                    document_hash,
+                )
 
             except Exception as exc:
+                st.session_state["answer_result"] = make_result(
+                    question.strip(),
+                    None,
+                    [],
+                    friendly_error(exc),
+                    document_hash,
+                )
 
-                st.session_state[
-                    "answer_result"
-                ] = {
-                    "question": question.strip(),
-                    "answer": None,
-                    "evidence": [],
-                    "error": (
-                        "Gemini could not complete "
-                        f"the request: {exc}"
-                    ),
-                    "document_hash": document_hash,
-                }
+    result = st.session_state.get("answer_result")
 
-
-    result = st.session_state.get(
-        "answer_result"
-    )
-
-    if (
-        result
-        and result.get("document_hash")
-        == document_hash
-    ):
-
+    if result and result.get("document_hash") == document_hash:
         st.divider()
-
-        st.subheader(
-            "AI Answer"
-        )
+        st.subheader("AI Answer")
 
         if result.get("error"):
-
-            st.error(
-                result["error"]
-            )
-
+            st.error(result["error"])
         else:
+            st.write(result["answer"])
 
-            st.write(
-                result["answer"]
-            )
-
-            st.subheader(
-                "Evidence"
-            )
-
-            evidence = result.get(
-                "evidence",
-                [],
-            )
+            evidence = result.get("evidence", [])
 
             if evidence:
-
+                st.subheader("Evidence")
                 for item in evidence:
-
-                    st.write(
-                        f'"{item["quote"]}"'
-                    )
-
+                    st.write(f'"{item["quote"]}"')
                     st.caption(
-                        f"Source: {filename} · "
-                        f"Page {item['page_number']}"
+                        f"Source: {filename} · Page {item['page_number']}"
                     )
-
-            else:
-
-                st.caption(
-                    "No supporting evidence was found."
-                )
 
     st.stop()
 
 
 # ============================================================
-# PDF / DOCUMENT EXTRACTION
+# DOCUMENT EXTRACTION
 # ============================================================
 
-if extension == ".pdf":
+if st.session_state.get("document_hash") != document_hash:
 
-    # --------------------------------------------------------
-    # Preserve existing PDF extraction
-    # --------------------------------------------------------
+    try:
+        if extension == ".pdf":
+            pages = extract_pdf_pages(file_bytes)
+        else:
+            pages = extract_document(file_bytes, filename)
 
-    if (
-        st.session_state.get(
-            "document_hash"
-        )
-        != document_hash
-    ):
+    except Exception as exc:
+        st.error(f"Document processing failed: {exc}")
+        st.stop()
 
-        try:
-
-            pages = extract_pdf_pages(
-                file_bytes
-            )
-
-        except ValueError as exc:
-
-            st.error(
-                str(exc)
-            )
-
-            st.stop()
+    st.session_state["document_hash"] = document_hash
+    st.session_state["document_pages"] = pages
+    st.session_state["document_chunks"] = chunk_document_pages(pages)
+    st.session_state["embeddings_ready"] = False
+    st.session_state.pop("answer_result", None)
 
 
-        st.session_state[
-            "document_hash"
-        ] = document_hash
-
-        st.session_state[
-            "document_pages"
-        ] = pages
-
-        st.session_state[
-            "document_chunks"
-        ] = chunk_document_pages(
-            pages
-        )
-
-        st.session_state.pop(
-            "document_embeddings",
-            None,
-        )
-
-        st.session_state.pop(
-            "answer_result",
-            None,
-        )
-
-else:
-
-    # --------------------------------------------------------
-    # New multimodal document extraction
-    # --------------------------------------------------------
-
-    if (
-        st.session_state.get(
-            "document_hash"
-        )
-        != document_hash
-    ):
-
-        try:
-
-            pages = extract_document(
-                file_bytes,
-                filename,
-            )
-
-        except Exception as exc:
-
-            st.error(
-                f"Document processing failed: {exc}"
-            )
-
-            st.stop()
-
-
-        st.session_state[
-            "document_hash"
-        ] = document_hash
-
-        st.session_state[
-            "document_pages"
-        ] = pages
-
-        st.session_state[
-            "document_chunks"
-        ] = chunk_document_pages(
-            pages
-        )
-
-        st.session_state.pop(
-            "document_embeddings",
-            None,
-        )
-
-        st.session_state.pop(
-            "answer_result",
-            None,
-        )
-
-
-# ============================================================
-# GET STORED DOCUMENT
-# ============================================================
-
-pages = st.session_state[
-    "document_pages"
-]
+pages = st.session_state["document_pages"]
 
 
 # ============================================================
@@ -415,10 +246,7 @@ pages = st.session_state[
 # ============================================================
 
 all_text = "\n\n".join(
-    (
-        f"Page {page['page_number']}\n"
-        f"{page.get('text', '')}"
-    )
+    f"Page {page['page_number']}\n{page.get('text', '')}"
     for page in pages
     if page.get("text")
 )
@@ -428,75 +256,42 @@ all_text = "\n\n".join(
 # DOCUMENT INFORMATION
 # ============================================================
 
-st.subheader(
-    "Document information"
-)
-
-st.write(
-    f"**Filename:** {filename}"
-)
-
-st.write(
-    f"**File type:** {extension.upper()}"
-)
-
-st.write(
-    f"**Sections/pages detected:** {len(pages)}"
-)
+st.subheader("Document information")
+st.write(f"**Filename:** {filename}")
+st.write(f"**File type:** {extension.upper()}")
+st.write(f"**Sections/pages detected:** {len(pages)}")
 
 
 # ============================================================
 # TEXT PREVIEW
 # ============================================================
 
-with st.expander(
-    "Extracted text preview",
-    expanded=False,
-):
+with st.expander("Extracted text preview", expanded=False):
 
     if all_text:
-
-        preview = all_text[
-            :PREVIEW_CHARACTER_LIMIT
-        ]
-
         st.text_area(
             "Text extracted from the document",
-            value=preview,
+            value=all_text[:PREVIEW_CHARACTER_LIMIT],
             height=220,
             disabled=True,
         )
 
-        if (
-            len(all_text)
-            > PREVIEW_CHARACTER_LIMIT
-        ):
-
+        if len(all_text) > PREVIEW_CHARACTER_LIMIT:
             st.caption(
                 f"Preview limited to the first "
-                f"{PREVIEW_CHARACTER_LIMIT:,} "
-                "characters."
+                f"{PREVIEW_CHARACTER_LIMIT:,} characters."
             )
-
     else:
-
-        st.warning(
-            "No selectable text was found."
-        )
+        st.warning("No selectable text was found.")
 
 
 # ============================================================
 # SCANNED PDF DETECTION
 # ============================================================
 
-is_scanned_pdf = (
-    extension == ".pdf"
-    and not bool(all_text)
-)
-
+is_scanned_pdf = extension == ".pdf" and not bool(all_text)
 
 if is_scanned_pdf:
-
     st.info(
         "This appears to be a scanned PDF. "
         "EviNex AI will use Gemini's multimodal "
@@ -508,22 +303,13 @@ if is_scanned_pdf:
 # QUESTION FORM
 # ============================================================
 
-with st.form(
-    "document_question_form"
-):
-
+with st.form("document_question_form"):
     question = st.text_input(
         "Ask a question about this document",
-        placeholder=(
-            "For example: What conclusion "
-            "does the report reach?"
-        ),
+        placeholder="For example: What conclusion does the report reach?",
         max_chars=500,
     )
-
-    submitted = st.form_submit_button(
-        "Ask"
-    )
+    submitted = st.form_submit_button("Ask")
 
 
 # ============================================================
@@ -533,292 +319,126 @@ with st.form(
 if submitted:
 
     if not question.strip():
-
-        st.warning(
-            "Enter a question to continue."
-        )
+        st.warning("Enter a question to continue.")
 
     else:
-
         try:
+            with st.spinner("Analyzing the document and asking Gemini..."):
 
-            with st.spinner(
-                "Analyzing the document and asking Gemini..."
-            ):
+                client = get_client()
 
-                client = (
-                    create_gemini_client()
-                )
-
-
-                # =================================================
-                # SCANNED PDF
-                # =================================================
-
+                # ---------------- SCANNED PDF ----------------
                 if is_scanned_pdf:
 
-                    answer = (
-                        generate_scanned_pdf_answer(
-                            file_bytes,
-                            question.strip(),
-                            client,
-                        )
+                    # Order: client, pdf_bytes, question
+                    answer = generate_scanned_pdf_answer(
+                        client,
+                        file_bytes,
+                        question.strip(),
                     )
 
-                    answer_result = {
-                        "question": question.strip(),
-                        "answer": answer[
-                            "answer"
-                        ],
-                        "evidence": answer[
-                            "evidence"
-                        ],
-                        "error": None,
-                        "document_hash": document_hash,
-                    }
+                    answer_result = make_result(
+                        question.strip(),
+                        answer["answer"],
+                        answer["evidence"],
+                        None,
+                        document_hash,
+                    )
 
-
-                # =================================================
-                # NORMAL DOCUMENT
-                # =================================================
-
+                # ---------------- NORMAL DOCUMENT ----------------
                 else:
 
-                    document_chunks = (
-                        st.session_state.get(
-                            "document_chunks"
+                    document_chunks = st.session_state.get("document_chunks")
+
+                    if document_chunks is None:
+                        document_chunks = chunk_document_pages(pages)
+
+                    # Embed once per document
+                    if not st.session_state.get("embeddings_ready"):
+
+                        # Order: client, chunks
+                        document_chunks = embed_document_chunks(
+                            client,
+                            document_chunks,
                         )
+
+                        st.session_state["document_chunks"] = document_chunks
+                        st.session_state["embeddings_ready"] = True
+
+                    # Order: client, chunks, question
+                    relevant_chunks = retrieve_relevant_content(
+                        client,
+                        document_chunks,
+                        question.strip(),
+                        top_k=5,
                     )
-
-                    if (
-                        document_chunks
-                        is None
-                    ):
-
-                        document_chunks = (
-                            chunk_document_pages(
-                                pages
-                            )
-                        )
-
-
-                    document_embeddings = (
-                        st.session_state.get(
-                            "document_embeddings"
-                        )
-                    )
-
-
-                    if (
-                        document_embeddings
-                        is None
-                    ):
-
-                        document_embeddings = (
-                            embed_document_chunks(
-                                document_chunks,
-                                client,
-                            )
-                        )
-
-                        st.session_state[
-                            "document_chunks"
-                        ] = (
-                            document_chunks
-                        )
-
-                        st.session_state[
-                            "document_embeddings"
-                        ] = (
-                            document_embeddings
-                        )
-
-
-                    relevant_chunks = (
-                        retrieve_relevant_content(
-                            pages,
-                            question.strip(),
-                            top_k=5,
-                            chunks=document_chunks,
-                            document_embeddings=(
-                                document_embeddings
-                            ),
-                            client=client,
-                        )
-                    )
-
 
                     if not relevant_chunks:
-
-                        answer_result = {
-                            "question": question.strip(),
-                            "answer": FALLBACK_ANSWER,
-                            "evidence": [],
-                            "error": None,
-                            "document_hash": document_hash,
-                        }
-
-                    else:
-
-                        answer = (
-                            generate_grounded_answer(
-                                question.strip(),
-                                relevant_chunks,
-                                client=client,
-                            )
+                        answer_result = make_result(
+                            question.strip(),
+                            FALLBACK_ANSWER,
+                            [],
+                            None,
+                            document_hash,
                         )
 
-                        answer_result = {
-                            "question": question.strip(),
-                            "answer": answer[
-                                "answer"
-                            ],
-                            "evidence": answer[
-                                "evidence"
-                            ],
-                            "error": None,
-                            "document_hash": document_hash,
-                        }
+                    else:
+                        # Order: client, question, retrieved_content
+                        answer = generate_grounded_answer(
+                            client,
+                            question.strip(),
+                            relevant_chunks,
+                        )
 
+                        answer_result = make_result(
+                            question.strip(),
+                            answer["answer"],
+                            answer["evidence"],
+                            None,
+                            document_hash,
+                        )
 
-                st.session_state[
-                    "answer_result"
-                ] = answer_result
-
-
-        except RuntimeError as exc:
-
-            if (
-                str(exc)
-                == "GEMINI_API_KEY is not configured."
-            ):
-
-                error_message = (
-                    "The Gemini API key is not "
-                    "available to the app. "
-                    "Check that GEMINI_API_KEY "
-                    "is saved in Streamlit Secrets."
-                )
-
-            else:
-
-                error_message = (
-                    "Gemini could not complete "
-                    f"the request: {exc}"
-                )
-
-
-            st.session_state[
-                "answer_result"
-            ] = {
-                "question": question.strip(),
-                "answer": None,
-                "evidence": [],
-                "error": error_message,
-                "document_hash": document_hash,
-            }
-
+                st.session_state["answer_result"] = answer_result
 
         except Exception as exc:
-
-            st.session_state[
-                "answer_result"
-            ] = {
-                "question": question.strip(),
-                "answer": None,
-                "evidence": [],
-                "error": (
-                    "Gemini could not complete "
-                    f"the request: {exc}"
-                ),
-                "document_hash": document_hash,
-            }
+            st.session_state["answer_result"] = make_result(
+                question.strip(),
+                None,
+                [],
+                friendly_error(exc),
+                document_hash,
+            )
 
 
 # ============================================================
 # DISPLAY ANSWER
 # ============================================================
 
-result = st.session_state.get(
-    "answer_result"
-)
+result = st.session_state.get("answer_result")
 
-
-if (
-    result
-    and result.get("document_hash")
-    == document_hash
-):
+if result and result.get("document_hash") == document_hash:
 
     st.divider()
-
-    st.subheader(
-        "AI Answer"
-    )
-
+    st.subheader("AI Answer")
 
     if result.get("error"):
-
-        st.error(
-            result["error"]
-        )
-
+        st.error(result["error"])
 
     else:
+        st.write(result["answer"])
 
-        st.write(
-            result["answer"]
-        )
+        st.subheader("Evidence")
 
-
-        st.subheader(
-            "Evidence"
-        )
-
-        evidence = result.get(
-            "evidence",
-            [],
-        )
-
+        evidence = result.get("evidence", [])
 
         if evidence:
-
             for item in evidence:
+                st.write(f'"{item["quote"]}"')
 
-                st.write(
-                    f'"{item["quote"]}"'
-                )
+                page_number = item["page_number"]
+                source_label = item.get("source_label") or f"Page {page_number}"
 
-                page_number = (
-                    item["page_number"]
-                )
-
-                source_label = (
-                    f"Page {page_number}"
-                )
-
-                if (
-                    1 <= page_number
-                    <= len(pages)
-                ):
-
-                    source_label = pages[
-                        page_number - 1
-                    ].get(
-                        "source_label",
-                        source_label,
-                    )
-
-
-                st.caption(
-                    f"Source: {filename} · "
-                    f"{source_label}"
-                )
-
+                st.caption(f"Source: {filename} · {source_label}")
 
         else:
-
-            st.caption(
-                "No supporting excerpt was "
-                "found in the document."
-            )
+            st.caption("No supporting excerpt was found in the document.")
