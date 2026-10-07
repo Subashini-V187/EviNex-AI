@@ -31,6 +31,15 @@ load_dotenv()
 MAX_FILE_SIZE_BYTES = 20 * 1024 * 1024
 PREVIEW_CHARACTER_LIMIT = 5000
 
+# Documents with less text than this are sent to Gemini in full.
+# This is more accurate than retrieval for small files such as spreadsheets,
+# and it allows questions that need totals, counts or comparisons.
+FULL_CONTEXT_CHAR_LIMIT = 200_000
+
+# PDFs with at most this many pages are sent to Gemini as the original file,
+# so it can read charts, diagrams and scanned pages, and no embeddings are used.
+PDF_DIRECT_MAX_PAGES = 40
+
 SUPPORTED_TYPES = [
     "pdf",
     "doc",
@@ -291,6 +300,11 @@ with st.expander("Extracted text preview", expanded=False):
 
 is_scanned_pdf = extension == ".pdf" and not bool(all_text)
 
+use_direct_pdf = (
+    extension == ".pdf"
+    and (is_scanned_pdf or len(pages) <= PDF_DIRECT_MAX_PAGES)
+)
+
 if is_scanned_pdf:
     st.info(
         "This appears to be a scanned PDF. "
@@ -328,7 +342,7 @@ if submitted:
                 client = get_client()
 
                 # ---------------- SCANNED PDF ----------------
-                if is_scanned_pdf:
+                if use_direct_pdf:
 
                     # Order: client, pdf_bytes, question
                     answer = generate_scanned_pdf_answer(
@@ -348,30 +362,57 @@ if submitted:
                 # ---------------- NORMAL DOCUMENT ----------------
                 else:
 
-                    document_chunks = st.session_state.get("document_chunks")
+                    # Build the full text of every page/sheet
+                    full_pages = []
 
-                    if document_chunks is None:
-                        document_chunks = chunk_document_pages(pages)
+                    for page in pages:
+                        parts = [page.get("text", "")]
 
-                    # Embed once per document
-                    if not st.session_state.get("embeddings_ready"):
+                        for table in page.get("tables", []):
+                            for row in table.get("data", []):
+                                parts.append(" | ".join(str(v) for v in row))
 
-                        # Order: client, chunks
-                        document_chunks = embed_document_chunks(
+                        page_text = "\n".join(p for p in parts if p)
+
+                        if page_text.strip():
+                            full_pages.append(
+                                {
+                                    "page_number": page.get("page_number", 1),
+                                    "text": page_text,
+                                    "source_label": page.get(
+                                        "source_label", "Document"
+                                    ),
+                                    "score": 1.0,
+                                }
+                            )
+
+                    total_chars = sum(len(p["text"]) for p in full_pages)
+
+                    if total_chars <= FULL_CONTEXT_CHAR_LIMIT:
+                        # Small document: give Gemini everything
+                        relevant_chunks = full_pages
+
+                    else:
+                        # Large document: embedding retrieval
+                        document_chunks = st.session_state.get("document_chunks")
+
+                        if document_chunks is None:
+                            document_chunks = chunk_document_pages(pages)
+
+                        if not st.session_state.get("embeddings_ready"):
+                            document_chunks = embed_document_chunks(
+                                client,
+                                document_chunks,
+                            )
+                            st.session_state["document_chunks"] = document_chunks
+                            st.session_state["embeddings_ready"] = True
+
+                        relevant_chunks = retrieve_relevant_content(
                             client,
                             document_chunks,
+                            question.strip(),
+                            top_k=8,
                         )
-
-                        st.session_state["document_chunks"] = document_chunks
-                        st.session_state["embeddings_ready"] = True
-
-                    # Order: client, chunks, question
-                    relevant_chunks = retrieve_relevant_content(
-                        client,
-                        document_chunks,
-                        question.strip(),
-                        top_k=5,
-                    )
 
                     if not relevant_chunks:
                         answer_result = make_result(
