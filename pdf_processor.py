@@ -105,6 +105,148 @@ def _generate_with_retry(client, model, contents, config=None):
 
 
 # ============================================================
+# CHARTS AND PAGE IMAGES
+# ============================================================
+
+CHART_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    nullable=True,
+    description=(
+        "Chart data. Fill ONLY when the user asks for a chart, graph, plot "
+        "or visualization, using numbers found in the document."
+    ),
+    properties={
+        "chart_type": types.Schema(
+            type=types.Type.STRING, description="One of: bar, line, pie"
+        ),
+        "title": types.Schema(type=types.Type.STRING),
+        "x_label": types.Schema(type=types.Type.STRING),
+        "y_label": types.Schema(type=types.Type.STRING),
+        "categories": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(type=types.Type.STRING),
+        ),
+        "series": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "name": types.Schema(type=types.Type.STRING),
+                    "values": types.Schema(
+                        type=types.Type.ARRAY,
+                        items=types.Schema(type=types.Type.NUMBER),
+                    ),
+                },
+                required=["name", "values"],
+            ),
+        ),
+    },
+    required=["chart_type", "categories", "series"],
+)
+
+
+def _clean_chart(chart):
+    """Validate chart data from Gemini; return None if unusable."""
+    if not isinstance(chart, dict):
+        return None
+
+    categories = [str(c) for c in (chart.get("categories") or [])]
+
+    series = []
+
+    for item in chart.get("series") or []:
+        try:
+            values = [float(v) for v in (item.get("values") or [])]
+        except (TypeError, ValueError, AttributeError):
+            continue
+
+        if len(values) != len(categories):
+            continue
+
+        series.append(
+            {"name": str(item.get("name") or "Series"), "values": values}
+        )
+
+    if not categories or not series:
+        return None
+
+    chart_type = str(chart.get("chart_type") or "bar").lower()
+
+    if chart_type not in ("bar", "line", "pie"):
+        chart_type = "bar"
+
+    if chart_type == "pie":
+        series = series[:1]
+
+    return {
+        "chart_type": chart_type,
+        "title": str(chart.get("title") or ""),
+        "x_label": str(chart.get("x_label") or ""),
+        "y_label": str(chart.get("y_label") or ""),
+        "categories": categories,
+        "series": series,
+    }
+
+
+RICH_SCHEMA = types.Schema(
+    type=types.Type.OBJECT,
+    properties={
+        "answer": types.Schema(type=types.Type.STRING),
+        "chart": CHART_SCHEMA,
+        "show_pages": types.Schema(
+            type=types.Type.ARRAY,
+            items=types.Schema(type=types.Type.INTEGER),
+        ),
+    },
+    required=["answer"],
+)
+
+
+def _parse_rich_response(text):
+    try:
+        data = json.loads(text)
+    except Exception:
+        return {
+            "answer": text,
+            "evidence": [],
+            "chart": None,
+            "show_pages": [],
+        }
+
+    show_pages = []
+
+    for value in data.get("show_pages") or []:
+        try:
+            show_pages.append(int(value))
+        except (TypeError, ValueError):
+            continue
+
+    return {
+        "answer": data.get("answer") or FALLBACK_ANSWER,
+        "evidence": [],
+        "chart": _clean_chart(data.get("chart")),
+        "show_pages": show_pages[:3],
+    }
+
+
+def render_pdf_page(pdf_bytes, page_number, zoom=2.0):
+    """Render one PDF page (1-based) to PNG bytes, or None if out of range."""
+    document = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+
+    try:
+        if not 1 <= page_number <= document.page_count:
+            return None
+
+        page = document[page_number - 1]
+        pixmap = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom))
+
+        return pixmap.tobytes("png")
+
+    finally:
+        document.close()
+
+
+# ============================================================
 # PDF EXTRACTION
 # ============================================================
 
@@ -734,12 +876,16 @@ RULES:
 4. Evidence quotes must appear EXACTLY
    in the supplied content.
 5. Include the page or section number.
+6. ONLY if the user asks for a chart, graph, plot or visualization,
+   fill the chart field using numbers that appear in the evidence.
+   Never invent numbers. Otherwise leave the chart field empty.
 """
 
     schema = types.Schema(
         type=types.Type.OBJECT,
         properties={
             "answer": types.Schema(type=types.Type.STRING),
+            "chart": CHART_SCHEMA,
             "evidence": types.Schema(
                 type=types.Type.ARRAY,
                 items=types.Schema(
@@ -798,7 +944,12 @@ RULES:
                     )
                     break
 
-        return {"answer": answer, "evidence": verified_evidence}
+        return {
+            "answer": answer,
+            "evidence": verified_evidence,
+            "chart": _clean_chart(result.get("chart")),
+            "show_pages": [],
+        }
 
     except Exception as exc:
         busy = _busy_error(exc)
@@ -810,7 +961,7 @@ RULES:
 
 
 # ============================================================
-# SCANNED PDF
+# SCANNED / VISUAL PDF (sent to Gemini as the original file)
 # ============================================================
 
 def generate_scanned_pdf_answer(client, pdf_bytes, question):
@@ -826,39 +977,41 @@ def generate_scanned_pdf_answer(client, pdf_bytes, question):
         prompt = f"""
 You are EviNex AI.
 
-Analyze the uploaded PDF.
+Analyze the uploaded PDF. It may contain scanned pages, images,
+tables, charts, diagrams and text.
 
-The PDF may contain:
-- scanned pages
-- images
-- tables
-- charts
-- diagrams
-- text
-
-Answer the question using ONLY information
-contained in the uploaded PDF.
+Answer the question using ONLY information contained in the PDF.
 
 QUESTION:
 {question}
 
 RULES:
 1. Do not use outside knowledge.
-2. If the answer is not present, say:
+2. If the answer is not present, the answer must be:
    Cannot determine from the document.
-3. Give a concise answer.
-4. Mention the relevant page number
-   when possible.
+3. Give a concise answer and mention the page number
+   (the position of the page in the file, starting at 1).
+4. If the user asks you to create a chart, graph, plot or
+   visualization, fill the chart field using ONLY numbers that
+   appear in the PDF. Never invent numbers.
+5. If the user asks to see, show or display a figure, chart,
+   diagram, image, scan or page, put the page numbers that contain
+   it in show_pages (at most 3).
+6. Otherwise leave chart empty and show_pages empty.
 """
 
         response = _generate_with_retry(
             client,
             model=GENERATION_MODEL,
             contents=[uploaded_file, prompt],
-            config=types.GenerateContentConfig(temperature=0),
+            config=types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=RICH_SCHEMA,
+            ),
         )
 
-        return {"answer": response.text, "evidence": []}
+        return _parse_rich_response(response.text)
 
     except Exception as exc:
         busy = _busy_error(exc)
@@ -885,24 +1038,21 @@ document intelligence assistant.
 
 Analyze the supplied image.
 
-Answer ONLY using information visible
-in the image.
+Answer ONLY using information visible in the image.
 
 QUESTION:
 {question}
 
 RULES:
 1. Do not use outside knowledge.
-2. If the answer cannot be determined,
-   say:
+2. If the answer cannot be determined, the answer must be:
    Cannot determine from the document.
 3. Be concise.
-4. Carefully inspect:
-   - text
-   - tables
-   - charts
-   - labels
-   - numbers
+4. Carefully inspect text, tables, charts, labels and numbers.
+5. If the user asks you to create a chart, graph, plot or
+   visualization, fill the chart field using ONLY numbers visible
+   in the image. Never invent numbers.
+6. Otherwise leave chart empty. Always leave show_pages empty.
 """
 
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
@@ -912,10 +1062,17 @@ RULES:
             client,
             model=GENERATION_MODEL,
             contents=[image_part, prompt],
-            config=types.GenerateContentConfig(temperature=0),
+            config=types.GenerateContentConfig(
+                temperature=0,
+                response_mime_type="application/json",
+                response_schema=RICH_SCHEMA,
+            ),
         )
 
-        return {"answer": response.text, "evidence": []}
+        result = _parse_rich_response(response.text)
+        result["show_pages"] = []
+
+        return result
 
     except Exception as exc:
         busy = _busy_error(exc)
